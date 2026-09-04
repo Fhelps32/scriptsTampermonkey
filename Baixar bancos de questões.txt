@@ -1,0 +1,515 @@
+// ==UserScript==
+// @name         Baixar bancos de questões AV1/AV2 (Dependência UGB)
+// @namespace    https://dependencia.ugb.edu.br/
+// @version      3.0
+// @description  Percorre os cursos da categoria aberta, localiza o banco de questões e exporta as categorias AV1 e AV2
+// @author       Você
+// @match        https://dependencia.ugb.edu.br/course/index.php*
+// @icon         https://dependencia.ugb.edu.br/favicon.ico
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------------
+  // Ajustes
+  // ----------------------------------------------------------------------
+  const CONFIG = {
+    banco: /ADP[\s\-_.]*DEP/i,                // "ADPDEP", "ADP-DEP", "ADP DEP"...
+    categorias: [/^\s*AV1\b/i, /^\s*AV2\b/i], // categorias dentro do banco
+    formato: 'xml',                           // xml | gift | moodle | xhtml ...
+    incluirCategoria: 0,                      // "escrever categoria no arquivo" — desmarcado
+    incluirContexto: 0,                       // "escrever contexto no arquivo" — desmarcado
+    pausaMs: 800,
+    aceitarBancoUnico: false,                 // se o nome não bater, usar o banco quando só existir um
+    usarIframe: true,                         // fallback para páginas montadas por JS
+    esperaIframeMs: 12000,
+  };
+
+  const ORIGEM = location.origin;
+  const abs = (u) => new URL(u, ORIGEM).href;
+  const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
+  const limpaNome = (s) => s.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+  const txt = (el) => (el.textContent || '').replace(/\u00a0/g, ' ').trim();
+
+  // ----------------------------------------------------------------------
+  // Rede
+  // ----------------------------------------------------------------------
+  async function baixaPagina(url) {
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      const html = await resp.text();
+      return {
+        url,
+        status: resp.status,
+        ok: resp.ok,
+        doc: new DOMParser().parseFromString(html, 'text/html'),
+      };
+    } catch (e) {
+      return { url, status: 0, ok: false, doc: null, erro: e.message };
+    }
+  }
+
+  // Carrega a página num iframe oculto: serve para conteúdo montado por JavaScript
+  function carregaComJs(url, temOQuePreciso) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let doc = null;
+        try { doc = frame.contentDocument; } catch (e) { /* ignora */ }
+        const pronto = doc && doc.readyState === 'complete';
+        if (pronto && temOQuePreciso(doc)) { clearInterval(timer); const d = doc; setTimeout(() => frame.remove(), 100); resolve(d.cloneNode(true)); return; }
+        if (Date.now() > limite) {
+          clearInterval(timer);
+          const d = doc ? doc.cloneNode(true) : null;
+          frame.remove();
+          resolve(d);
+        }
+      }, 400);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // 1. Cursos da categoria (incluindo as demais páginas da paginação)
+  // ----------------------------------------------------------------------
+  async function listarCursos() {
+    const paginas = new Map([[location.href, document]]);
+    document.querySelectorAll('.paging a[href], nav a[href*="page="]').forEach((a) => {
+      if (!paginas.has(a.href)) paginas.set(a.href, null);
+    });
+
+    const cursos = new Map();
+    for (const [url, cache] of paginas) {
+      let doc = cache;
+      if (!doc) {
+        const r = await baixaPagina(url);
+        if (!r.doc) continue;
+        doc = r.doc;
+      }
+      const escopo = doc.querySelector('#region-main') || doc.body;
+      escopo.querySelectorAll('a[href*="/course/view.php?id="]').forEach((a) => {
+        const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
+        const nome = txt(a);
+        if (id && nome && !cursos.has(id)) cursos.set(id, nome);
+      });
+    }
+    return [...cursos].map(([id, nome]) => ({ id, nome }));
+  }
+
+  // ----------------------------------------------------------------------
+  // 2. Localizar o banco de questões do curso
+  // ----------------------------------------------------------------------
+  const RE_LINK_BANCO = /\/question\/edit\.php\?|\/mod\/qbank\/view\.php\?/;
+
+  function linksDeBanco(doc) {
+    if (!doc) return [];
+    return [...doc.querySelectorAll('a[href]')]
+      .map((a) => {
+        const href = a.getAttribute('href') || '';
+        if (!RE_LINK_BANCO.test(href)) return null;
+        const p = new URL(href, ORIGEM).searchParams;
+        const cmid = p.get('cmid') || (href.includes('/mod/qbank/view.php') ? p.get('id') : null);
+        return cmid ? { href: abs(href), texto: txt(a), cmid } : null;
+      })
+      .filter(Boolean);
+  }
+
+  async function localizaBanco(courseid, diag) {
+    const vistos = [];
+    const tentar = async (url, rotulo) => {
+      const r = await baixaPagina(url);
+      const links = linksDeBanco(r.doc);
+      vistos.push({ rotulo, url, status: r.status, links });
+      if (diag) {
+        diag(`   ${rotulo}: HTTP ${r.status}, ${links.length} link(s) de banco`);
+        links.slice(0, 6).forEach((l) => diag(`      · "${l.texto}" -> cmid ${l.cmid}`));
+      }
+      return links.find((l) => CONFIG.banco.test(l.texto)) || null;
+    };
+
+    // a) página oficial de bancos do curso (Moodle 5.0)
+    let achado = await tentar(`${ORIGEM}/question/banks.php?courseid=${courseid}`, 'banks.php');
+    if (achado) return { link: achado, vistos };
+
+    // Se a página listou bancos mas nenhum bate com o filtro, o problema é o nome:
+    // não adianta procurar nas outras páginas, que mostram a mesma lista.
+    const listados = vistos[0].links;
+    if (listados.length) {
+      const nomes = [...new Set(listados.map((l) => l.texto).filter(Boolean))];
+      const cmids = [...new Set(listados.map((l) => l.cmid))];
+      if (diag) diag(`   nenhum bate com o filtro. Bancos do curso: ${nomes.join(' | ') || '(sem nome)'}`);
+      if (CONFIG.aceitarBancoUnico && cmids.length === 1) {
+        const unico = listados.find((l) => l.texto) || listados[0];
+        if (diag) diag('   só existe um banco: usando ele mesmo assim');
+        return { link: unico, vistos, nomes };
+      }
+      return { link: null, vistos, nomes };
+    }
+
+    // b) página do curso: pega o link "Bancos de questões" do menu Mais
+    const cursoPag = await baixaPagina(`${ORIGEM}/course/view.php?id=${courseid}`);
+    achado = linksDeBanco(cursoPag.doc).find((l) => CONFIG.banco.test(l.texto));
+    if (diag) diag(`   course/view.php: HTTP ${cursoPag.status}`);
+    if (achado) return { link: achado, vistos };
+
+    const linkBanks = [...(cursoPag.doc ? cursoPag.doc.querySelectorAll('a[href]') : [])]
+      .map((a) => a.getAttribute('href') || '')
+      .find((h) => /question\/banks\.php|mod\/qbank\/index\.php/.test(h));
+    if (linkBanks) {
+      achado = await tentar(abs(linkBanks), 'link do menu Mais');
+      if (achado) return { link: achado, vistos };
+    }
+
+    // c) a lista de bancos pode ser montada por JavaScript: repete dentro de um iframe
+    if (CONFIG.usarIframe) {
+      const url = linkBanks ? abs(linkBanks) : `${ORIGEM}/question/banks.php?courseid=${courseid}`;
+      if (diag) diag(`   tentando com JavaScript (iframe): ${url}`);
+      const doc = await carregaComJs(url, (d) => linksDeBanco(d).length > 0);
+      const links = linksDeBanco(doc);
+      vistos.push({ rotulo: 'iframe', url, status: 'js', links });
+      if (diag) {
+        diag(`   iframe: ${links.length} link(s) de banco`);
+        links.slice(0, 6).forEach((l) => diag(`      · "${l.texto}" -> cmid ${l.cmid}`));
+      }
+      achado = links.find((l) => CONFIG.banco.test(l.texto));
+      if (achado) return { link: achado, vistos };
+    }
+
+    return { link: null, vistos };
+  }
+
+  // ----------------------------------------------------------------------
+  // 3. Página de exportação do banco
+  // ----------------------------------------------------------------------
+  async function paginaExportacao(link, courseid, diag) {
+    const candidatas = [];
+
+    // Preferência: o próprio link "Exportar" que a página do banco oferece
+    const bancoPag = await baixaPagina(link ? link.href : `${ORIGEM}/course/view.php?id=${courseid}`);
+    if (bancoPag.doc) {
+      [...bancoPag.doc.querySelectorAll('a[href]')].forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        if (/export/i.test(href) && /question/i.test(href)) candidatas.push(abs(href));
+      });
+    }
+    if (link) {
+      candidatas.push(`${ORIGEM}/question/bank/exportquestions/export.php?cmid=${link.cmid}`);
+      candidatas.push(`${ORIGEM}/question/export.php?cmid=${link.cmid}`);
+    }
+    candidatas.push(`${ORIGEM}/question/bank/exportquestions/export.php?courseid=${courseid}`);
+    candidatas.push(`${ORIGEM}/question/export.php?courseid=${courseid}`);
+
+    for (const url of [...new Set(candidatas)]) {
+      const r = await baixaPagina(url);
+      const temForm = !!(r.doc && r.doc.querySelector('select[name="category"]'));
+      if (diag) diag(`   export ${url.replace(ORIGEM, '')}: HTTP ${r.status}${temForm ? ' — formulário ok' : ''}`);
+      if (temForm) return { url, doc: r.doc };
+    }
+    return null;
+  }
+
+  function achaOpcao(doc, regex) {
+    return [...doc.querySelectorAll('select[name="category"] option')]
+      .find((o) => regex.test(txt(o)));
+  }
+
+  // ----------------------------------------------------------------------
+  // 4. Exportar e baixar
+  // ----------------------------------------------------------------------
+  async function exportar(pagina, opcao, nomeArquivo) {
+    const form =
+      pagina.doc.querySelector('form[action*="export"]') ||
+      pagina.doc.querySelector('#region-main form');
+    if (!form) throw new Error('formulário de exportação não encontrado');
+
+    const dados = new FormData();
+    form.querySelectorAll('input[type="hidden"]').forEach((i) => { if (i.name) dados.set(i.name, i.value); });
+    // O Moodle troca de categoria quando 'category' difere de 'cat', então mando só 'category'
+    dados.set('category', opcao.value);
+    dados.delete('cat');
+    dados.set('format', CONFIG.formato);
+    // São checkboxes: desmarcado significa ausente, não zero
+    if (CONFIG.incluirCategoria) dados.set('cattofile', 1);
+    if (CONFIG.incluirContexto) dados.set('contexttofile', 1);
+    dados.set('submitbutton', 'Exportar questões para arquivo');
+
+    const acao = abs(form.getAttribute('action') || pagina.url);
+    const resp = await fetch(acao, { method: 'POST', credentials: 'same-origin', body: dados });
+    const tipo = resp.headers.get('content-type') || '';
+
+    // Alguns formatos vêm direto na resposta do POST
+    if (!/text\/html/i.test(tipo)) { baixaBlob(await resp.blob(), nomeArquivo); return; }
+
+    const html = await resp.text();
+    const urlArquivo = achaUrlDoArquivo(html, opcao, nomeArquivo);
+
+    const arq = await fetch(urlArquivo, { credentials: 'same-origin' });
+    if (!arq.ok) throw new Error(`download falhou (HTTP ${arq.status}) em ${urlArquivo.replace(ORIGEM, '')}`);
+
+    const blob = await arq.blob();
+    if (blob.size < 200 && /html/i.test(blob.type)) throw new Error('o servidor devolveu uma página, não o arquivo');
+    baixaBlob(blob, nomeArquivo);
+  }
+
+  // A página de resultado traz a URL em dois lugares: no link "seu arquivo deve baixar"
+  // e num document.location.replace(...) injetado por JS. Procuro nos dois.
+  function achaUrlDoArquivo(html, opcao, nomeArquivo) {
+    const bruto = html.replace(/&amp;/g, '&').replace(/\\\//g, '/');
+    const m = bruto.match(/https?:\/\/[^"'\s\\)]*pluginfile\.php[^"'\s\\)]*question\/export[^"'\s\\)]*/);
+    if (m) return m[0];
+
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const link = doc.querySelector('a[href*="pluginfile.php"]');
+    if (link) return abs(link.getAttribute('href'));
+
+    // Sem link: provavelmente o formulário voltou com erro. Mostra o motivo.
+    const erro = [...doc.querySelectorAll('.error, .invalid-feedback, .alert-danger')]
+      .map((e) => txt(e)).filter(Boolean).slice(0, 2).join(' / ');
+    if (erro) throw new Error(`o Moodle recusou o formulário: ${erro}`);
+
+    // Último recurso: montar a URL como o Moodle monta (palavras, não 1/0)
+    const [catid, ctxid] = opcao.value.split(',');
+    if (!catid || !ctxid) throw new Error('não achei o link do arquivo gerado');
+    const comCategoria = CONFIG.incluirCategoria ? 'withcategories' : 'nocategories';
+    const comContexto = CONFIG.incluirContexto ? 'withcontexts' : 'nocontexts';
+    return `${ORIGEM}/pluginfile.php/${ctxid}/question/export/${catid}/${CONFIG.formato}/${comCategoria}/${comContexto}/${encodeURIComponent(nomeArquivo)}?forcedownload=1`;
+  }
+
+  function baixaBlob(blob, nome) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = nome;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  // ----------------------------------------------------------------------
+  // 5. Execução
+  // ----------------------------------------------------------------------
+  let rodando = false;
+  let interromper = false;
+  let perguntarSempre = true;
+
+  function confirmaMateria(curso, alvos, indice, total) {
+    return new Promise((resolve) => {
+      const fundo = document.createElement('div');
+      fundo.style.cssText = `position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);
+        display:flex;align-items:center;justify-content:center;font:13px/1.5 system-ui,sans-serif;`;
+
+      const caixa = document.createElement('div');
+      caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(460px,90vw);
+        box-shadow:0 12px 40px rgba(0,0,0,.3);`;
+
+      const lista = alvos.map((a) => `<li><code>${a.nomeArquivo}</code> — ${a.detalhe}</li>`).join('');
+      caixa.innerHTML = `
+        <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Matéria ${indice} de ${total}</div>
+        <div style="font-size:15px;font-weight:600;margin:4px 0 10px;">${curso.nome}</div>
+        <div style="color:#333;">Banco encontrado. Vou exportar:</div>
+        <ul style="margin:6px 0 12px 18px;padding:0;color:#333;">${lista}</ul>
+        <label style="display:flex;gap:6px;align-items:center;color:#555;margin-bottom:14px;">
+          <input type="checkbox" id="ugb-nao-perguntar"> Baixar as próximas sem perguntar
+        </label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="ugb-parar" style="padding:8px 12px;border:0;border-radius:5px;background:#b3261e;color:#fff;cursor:pointer;">Parar tudo</button>
+          <button id="ugb-pular" style="padding:8px 12px;border:1px solid #ccd;border-radius:5px;background:#fff;color:#333;cursor:pointer;">Pular esta</button>
+          <button id="ugb-baixar" style="padding:8px 12px;border:0;border-radius:5px;background:#28a745;color:#fff;cursor:pointer;">Baixar</button>
+        </div>`;
+
+      fundo.appendChild(caixa);
+      document.body.appendChild(fundo);
+      caixa.querySelector('#ugb-baixar').focus();
+
+      const responde = (r) => {
+        if (r === 'baixar' && caixa.querySelector('#ugb-nao-perguntar').checked) perguntarSempre = false;
+        document.removeEventListener('keydown', tecla);
+        fundo.remove();
+        resolve(r);
+      };
+      const tecla = (e) => {
+        if (e.key === 'Escape') responde('pular');
+        if (e.key === 'Enter') responde('baixar');
+      };
+
+      caixa.querySelector('#ugb-baixar').onclick = () => responde('baixar');
+      caixa.querySelector('#ugb-pular').onclick = () => responde('pular');
+      caixa.querySelector('#ugb-parar').onclick = () => responde('parar');
+      fundo.onclick = (e) => { if (e.target === fundo) responde('pular'); };
+      document.addEventListener('keydown', tecla);
+    });
+  }
+
+  async function diagnosticar() {
+    if (rodando) return;
+    rodando = true;
+    travaBotoes(true);
+    painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} cursos na categoria.`);
+      if (!cursos.length) return;
+
+      const curso = cursos[0];
+      log(`Testando: ${curso.nome} (id ${curso.id})`);
+
+      const { link } = await localizaBanco(curso.id, (m) => log(m));
+      if (!link) { log('Nenhum link de banco encontrado nas páginas acima.', 'erro'); return; }
+      log(`Banco: "${link.texto}" — cmid ${link.cmid}`, 'ok');
+
+      const pagina = await paginaExportacao(link, curso.id, (m) => log(m));
+      if (!pagina) { log('Nenhuma página de exportação respondeu com o formulário.', 'erro'); return; }
+      log(`Exportação: ${pagina.url.replace(ORIGEM, '')}`, 'ok');
+
+      const opcoes = [...pagina.doc.querySelectorAll('select[name="category"] option')];
+      log(`Categorias no seletor (${opcoes.length}):`);
+      opcoes.slice(0, 20).forEach((o) => log(`   · ${txt(o)}  [${o.value}]`));
+    } catch (e) {
+      log(`Erro: ${e.message}`, 'erro');
+    } finally {
+      rodando = false;
+      travaBotoes(false);
+    }
+  }
+
+  async function executar(somenteTestar) {
+    if (rodando) return;
+    rodando = true;
+    interromper = false;
+    perguntarSempre = true;
+    travaBotoes(true);
+    botaoParar.style.display = '';
+    painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} cursos encontrados nesta categoria.`);
+      if (!somenteTestar) log('Vou confirmar matéria por matéria antes de baixar.');
+
+      let baixados = 0, semBanco = 0, pulados = 0, erros = 0;
+
+      for (let i = 0; i < cursos.length; i++) {
+        const curso = cursos[i];
+        if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+        log(`— ${curso.nome}`);
+
+        try {
+          const achadoBanco = await localizaBanco(curso.id, null);
+          const link = achadoBanco.link;
+          if (!link) {
+            const nomes = achadoBanco.nomes && achadoBanco.nomes.length
+              ? ` — o curso tem: ${achadoBanco.nomes.join(' | ')}`
+              : '';
+            log(`   banco não encontrado${nomes}`, 'aviso');
+            semBanco++;
+            continue;
+          }
+
+          const pagina = await paginaExportacao(link, curso.id, null);
+          if (!pagina) { log('   página de exportação não encontrada', 'aviso'); semBanco++; continue; }
+
+          const alvos = [];
+          for (const regex of CONFIG.categorias) {
+            const opcao = achaOpcao(pagina.doc, regex);
+            if (!opcao) { log(`   categoria ${regex.source} ausente`, 'aviso'); continue; }
+            const texto = txt(opcao);
+            const rotulo = texto.split(/\s*\(/)[0];
+            alvos.push({
+              opcao,
+              detalhe: texto,
+              nomeArquivo: `${limpaNome(curso.nome)} - ${limpaNome(rotulo)}.${CONFIG.formato}`,
+            });
+          }
+          if (!alvos.length) { log('   nenhuma categoria AV encontrada', 'aviso'); continue; }
+
+          if (somenteTestar) { alvos.forEach((a) => log(`   ok: ${a.nomeArquivo}`)); continue; }
+
+          const resposta = perguntarSempre
+            ? await confirmaMateria(curso, alvos, i + 1, cursos.length)
+            : 'baixar';
+          if (resposta === 'parar') { log('Interrompido por você.', 'aviso'); break; }
+          if (resposta === 'pular') { log('   pulada', 'aviso'); pulados++; continue; }
+
+          for (const alvo of alvos) {
+            if (interromper) break;
+            await exportar(pagina, alvo.opcao, alvo.nomeArquivo);
+            log(`   baixado: ${alvo.nomeArquivo}`, 'ok');
+            baixados++;
+            await dorme(CONFIG.pausaMs);
+          }
+        } catch (e) {
+          log(`   erro: ${e.message}`, 'erro');
+          erros++;
+        }
+        await dorme(CONFIG.pausaMs);
+      }
+
+      log(`Fim. ${baixados} arquivos, ${pulados} puladas, ${semBanco} sem o banco, ${erros} erros.`);
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false;
+      interromper = false;
+      perguntarSempre = true;
+      travaBotoes(false);
+      botaoParar.style.display = 'none';
+      botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // Painel
+  // ----------------------------------------------------------------------
+  const painel = document.createElement('div');
+  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;width:380px;
+    font:12px/1.45 system-ui,sans-serif;background:#fff;border:1px solid #ccd;border-radius:8px;
+    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
+
+  const titulo = document.createElement('div');
+  titulo.textContent = 'Bancos AV1/AV2';
+  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
+
+  const botoes = document.createElement('div');
+  botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+
+  const criaBotao = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoes.appendChild(b);
+    return b;
+  };
+
+  const botao = criaBotao('Baixar AV1 e AV2', '#28a745', () => executar(false));
+  const botaoTeste = criaBotao('Só listar', '#5a6673', () => executar(true));
+  const botaoDiag = criaBotao('Diagnosticar', '#2d5bd0', diagnosticar);
+  const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
+  botaoParar.style.display = 'none';
+
+  const travaBotoes = (t) => { botao.disabled = botaoTeste.disabled = botaoDiag.disabled = t; };
+
+  const painelLog = document.createElement('div');
+  painelLog.style.cssText = 'margin-top:8px;max-height:340px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+
+  painel.append(titulo, botoes, painelLog);
+  document.body.appendChild(painel);
+
+  function log(msg, tipo) {
+    const cor = { ok: '#177245', erro: '#b3261e', aviso: '#8a6100' }[tipo] || '#333';
+    const linha = document.createElement('div');
+    linha.style.color = cor;
+    linha.textContent = msg;
+    painelLog.appendChild(linha);
+    painelLog.scrollTop = painelLog.scrollHeight;
+    console.log('[UGB]', msg);
+  }
+})();

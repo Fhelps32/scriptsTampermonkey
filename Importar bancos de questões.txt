@@ -1,0 +1,674 @@
+// ==UserScript==
+// @name         Importar bancos de questões AV1/AV2 (Dependência UGB)
+// @namespace    https://dependencia.ugb.edu.br/
+// @version      1.0
+// @description  Importa os XMLs exportados de um período para os bancos das salas do período novo
+// @author       Você
+// @match        https://dependencia.ugb.edu.br/course/index.php*
+// @icon         https://dependencia.ugb.edu.br/favicon.ico
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------------
+  // Ajustes
+  // ----------------------------------------------------------------------
+  const CONFIG = {
+    banco: /ADP[\s\-_.]*DEP/i,                // nome do banco de destino
+    categorias: [/^\s*AV1\b/i, /^\s*AV2\b/i], // categorias de destino
+    formato: 'xml',
+    categoriaDoArquivo: 0,                    // "obter categoria do arquivo" — desmarcado
+    contextoDoArquivo: 0,                     // "obter contexto do arquivo" — desmarcado
+    notasProximas: false,                     // false = "erro se a nota não bater" (padrão do Moodle)
+    pararNoErro: 1,
+    pausaMs: 1000,
+    repoIdUpload: null,                       // preencha só se o script não achar sozinho
+    usarIframe: true,
+    esperaIframeMs: 12000,
+  };
+
+  const ORIGEM = location.origin;
+  const abs = (u) => new URL(u, ORIGEM).href;
+  const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
+  const txt = (el) => (el.textContent || '').replace(/\u00a0/g, ' ').trim();
+
+  // Chave de comparação entre nome de arquivo e nome de curso.
+  // Tira [26.1], [ADP-DEP], (VR-DIR.M), acentos, símbolos e espaços.
+  const chave = (s) =>
+    s.replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\([^)]*\)/g, ' ')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  // ----------------------------------------------------------------------
+  // Rede
+  // ----------------------------------------------------------------------
+  async function baixaPagina(url) {
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      const html = await resp.text();
+      return { url, status: resp.status, ok: resp.ok, html, doc: new DOMParser().parseFromString(html, 'text/html') };
+    } catch (e) {
+      return { url, status: 0, ok: false, html: '', doc: null, erro: e.message };
+    }
+  }
+
+  function carregaComJs(url, temOQuePreciso) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let doc = null;
+        try { doc = frame.contentDocument; } catch (e) { /* ignora */ }
+        if (doc && doc.readyState === 'complete' && temOQuePreciso(doc)) {
+          clearInterval(timer);
+          const copia = doc.cloneNode(true);
+          setTimeout(() => frame.remove(), 100);
+          resolve(copia);
+          return;
+        }
+        if (Date.now() > limite) {
+          clearInterval(timer);
+          const copia = doc ? doc.cloneNode(true) : null;
+          frame.remove();
+          resolve(copia);
+        }
+      }, 400);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Cursos da categoria aberta
+  // ----------------------------------------------------------------------
+  async function listarCursos() {
+    const paginas = new Map([[location.href, document]]);
+    document.querySelectorAll('.paging a[href], nav a[href*="page="]').forEach((a) => {
+      if (!paginas.has(a.href)) paginas.set(a.href, null);
+    });
+
+    const cursos = new Map();
+    for (const [url, cache] of paginas) {
+      let doc = cache;
+      if (!doc) { const r = await baixaPagina(url); if (!r.doc) continue; doc = r.doc; }
+      const escopo = doc.querySelector('#region-main') || doc.body;
+      escopo.querySelectorAll('a[href*="/course/view.php?id="]').forEach((a) => {
+        const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
+        const nome = txt(a);
+        if (id && nome && !cursos.has(id)) cursos.set(id, nome);
+      });
+    }
+    return [...cursos].map(([id, nome]) => ({ id, nome }));
+  }
+
+  // ----------------------------------------------------------------------
+  // Banco de questões do curso
+  // ----------------------------------------------------------------------
+  const RE_LINK_BANCO = /\/question\/edit\.php\?|\/mod\/qbank\/view\.php\?/;
+
+  function linksDeBanco(doc) {
+    if (!doc) return [];
+    return [...doc.querySelectorAll('a[href]')]
+      .map((a) => {
+        const href = a.getAttribute('href') || '';
+        if (!RE_LINK_BANCO.test(href)) return null;
+        const p = new URL(href, ORIGEM).searchParams;
+        const cmid = p.get('cmid') || (href.includes('/mod/qbank/view.php') ? p.get('id') : null);
+        return cmid ? { href: abs(href), texto: txt(a), cmid } : null;
+      })
+      .filter(Boolean);
+  }
+
+  async function localizaBanco(courseid, diag) {
+    const tentar = async (url, rotulo) => {
+      const r = await baixaPagina(url);
+      const links = linksDeBanco(r.doc);
+      if (diag) {
+        diag(`   ${rotulo}: HTTP ${r.status}, ${links.length} link(s)`);
+        links.slice(0, 6).forEach((l) => diag(`      · "${l.texto}" -> cmid ${l.cmid}`));
+      }
+      return { links, achado: links.find((l) => CONFIG.banco.test(l.texto)) || null };
+    };
+
+    const a = await tentar(`${ORIGEM}/question/banks.php?courseid=${courseid}`, 'banks.php');
+    if (a.achado) return { link: a.achado };
+    if (a.links.length) {
+      const nomes = [...new Set(a.links.map((l) => l.texto).filter(Boolean))];
+      return { link: null, nomes };
+    }
+
+    if (CONFIG.usarIframe) {
+      const url = `${ORIGEM}/question/banks.php?courseid=${courseid}`;
+      if (diag) diag('   tentando com JavaScript (iframe)');
+      const doc = await carregaComJs(url, (d) => linksDeBanco(d).length > 0);
+      const links = linksDeBanco(doc);
+      const achado = links.find((l) => CONFIG.banco.test(l.texto));
+      if (achado) return { link: achado };
+      return { link: null, nomes: [...new Set(links.map((l) => l.texto).filter(Boolean))] };
+    }
+    return { link: null };
+  }
+
+  // ----------------------------------------------------------------------
+  // Página de importação
+  // ----------------------------------------------------------------------
+  async function paginaImportacao(link, courseid, diag) {
+    const candidatas = [];
+    const bancoPag = await baixaPagina(link.href);
+    if (bancoPag.doc) {
+      [...bancoPag.doc.querySelectorAll('a[href]')].forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        if (/import/i.test(href) && /question/i.test(href)) candidatas.push(abs(href));
+      });
+    }
+    candidatas.push(`${ORIGEM}/question/bank/importquestions/import.php?cmid=${link.cmid}`);
+    candidatas.push(`${ORIGEM}/question/import.php?cmid=${link.cmid}`);
+
+    for (const url of [...new Set(candidatas)]) {
+      const r = await baixaPagina(url);
+      const serve = !!(r.doc && r.doc.querySelector('select[name="category"]') && r.doc.querySelector('input[name="newfile"]'));
+      if (diag) diag(`   import ${url.replace(ORIGEM, '')}: HTTP ${r.status}${serve ? ' — formulário ok' : ''}`);
+      if (serve) return leConfigDaPagina(r);
+    }
+    return null;
+  }
+
+  // O id do repositório "Enviar um arquivo" aparece no JSON de inicialização do filepicker.
+  // A ordem das chaves varia entre versões, então tento vários formatos e, por último, faço o parse do bloco.
+  function extraiRepoDoHtml(html) {
+    const variantes = [
+      /"id"\s*:\s*"?(\d+)"?[^{}]{0,600}?"type"\s*:\s*"upload"/,
+      /"type"\s*:\s*"upload"[^{}]{0,600}?"id"\s*:\s*"?(\d+)"?/,
+    ];
+    for (const re of variantes) { const m = html.match(re); if (m) return m[1]; }
+
+    const marca = html.indexOf('"repositories"');
+    if (marca >= 0) {
+      const inicio = html.indexOf('{', marca);
+      let nivel = 0, fim = -1;
+      for (let j = inicio; j >= 0 && j < html.length; j++) {
+        if (html[j] === '{') nivel++;
+        else if (html[j] === '}') { nivel--; if (nivel === 0) { fim = j; break; } }
+      }
+      if (fim > 0) {
+        try {
+          const obj = JSON.parse(html.slice(inicio, fim + 1));
+          for (const k in obj) if (obj[k] && obj[k].type === 'upload') return String(obj[k].id || k);
+        } catch (e) { /* segue para o iframe */ }
+      }
+    }
+    return null;
+  }
+
+  // Último recurso: abre a página num iframe e lê o filepicker já inicializado pelo JS do Moodle
+  function inspecionaComJs(url, extrai) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let achado = null;
+        try {
+          const w = frame.contentWindow, d = frame.contentDocument;
+          if (d && d.readyState === 'complete') achado = extrai(w, d);
+        } catch (e) { /* ignora */ }
+        if (achado != null || Date.now() > limite) {
+          clearInterval(timer);
+          frame.remove();
+          resolve(achado);
+        }
+      }, 500);
+    });
+  }
+
+  let repoUploadCache = null;
+  let ctxCache = null;
+
+  async function descobreRepoUpload(urlPagina, diag) {
+    if (repoUploadCache) return { repoId: repoUploadCache, ctxId: ctxCache };
+    if (diag) diag('   procurando o repositório de upload via JavaScript…');
+    const achado = await inspecionaComJs(urlPagina, (w, d) => {
+      let repoId = null, ctxId = null;
+      const inst = w.M && w.M.core_filepicker && w.M.core_filepicker.instances;
+      if (inst) {
+        for (const k in inst) {
+          const op = inst[k] && inst[k].options;
+          const reps = op && op.repositories;
+          for (const r in (reps || {})) {
+            if (reps[r] && reps[r].type === 'upload') {
+              repoId = String(reps[r].id || r);
+              ctxId = (op.context && op.context.id) || null;
+              break;
+            }
+          }
+          if (repoId) break;
+        }
+      }
+      if (!repoId) repoId = extraiRepoDoHtml(d.documentElement.innerHTML);
+      if (!ctxId) ctxId = (w.M && w.M.cfg && w.M.cfg.contextid) || null;
+      return repoId ? { repoId, ctxId: ctxId ? String(ctxId) : null } : null;
+    });
+    if (achado) { repoUploadCache = achado.repoId; ctxCache = achado.ctxId || ctxCache; }
+    return achado || { repoId: null, ctxId: null };
+  }
+
+  // Extrai da página tudo que o upload precisa: draftitemid, sesskey, contexto e id do repositório "Enviar um arquivo"
+  function leConfigDaPagina(r) {
+    const doc = r.doc, html = r.html;
+    const campo = (n) => doc.querySelector(`input[name="${n}"]`);
+    const itemid = campo('newfile') ? campo('newfile').value : null;
+    const sesskey = campo('sesskey')
+      ? campo('sesskey').value
+      : (html.match(/"sesskey"\s*:\s*"([^"]+)"/) || [])[1];
+
+    const repoId = CONFIG.repoIdUpload || repoUploadCache || extraiRepoDoHtml(html);
+
+    const ctxId = (html.match(/"contextid"\s*:\s*(\d+)/) || [])[1]
+      || (html.match(/"context"\s*:\s*\{\s*"id"\s*:\s*(\d+)/) || [])[1]
+      || null;
+
+    return { url: r.url, doc, itemid, sesskey, repoId, ctxId };
+  }
+
+  function achaOpcao(doc, regex) {
+    return [...doc.querySelectorAll('select[name="category"] option')].find((o) => regex.test(txt(o)));
+  }
+
+  // ----------------------------------------------------------------------
+  // Upload + envio do formulário
+  // ----------------------------------------------------------------------
+  async function enviaParaRascunho(arquivo, cfg) {
+    if (!cfg.repoId) throw new Error('não achei o repositório de upload (preencha repoIdUpload no CONFIG)');
+
+    const fd = new FormData();
+    fd.set('repo_upload_file', arquivo, arquivo.name);
+    fd.set('itemid', cfg.itemid);
+    fd.set('repo_id', cfg.repoId);
+    fd.set('ctx_id', cfg.ctxId || '');
+    fd.set('env', 'filepicker');
+    fd.set('sesskey', cfg.sesskey);
+    fd.set('title', arquivo.name);
+    fd.set('savepath', '/');
+    fd.set('author', '');
+    fd.set('overwrite', 1);
+
+    const resp = await fetch(`${ORIGEM}/repository/repository_ajax.php?action=upload`, {
+      method: 'POST', credentials: 'same-origin', body: fd,
+    });
+    const texto = await resp.text();
+    let json;
+    try { json = JSON.parse(texto); } catch (e) { throw new Error(`upload devolveu resposta inesperada (HTTP ${resp.status})`); }
+    if (json.error) throw new Error(`upload recusado: ${json.error}`);
+    return json;
+  }
+
+  async function importa(cfg, opcao, arquivo) {
+    if (!cfg.repoId) {
+      const achado = await descobreRepoUpload(cfg.url, null);
+      cfg.repoId = achado.repoId;
+      cfg.ctxId = cfg.ctxId || achado.ctxId;
+    }
+    await enviaParaRascunho(arquivo, cfg);
+
+    const form = cfg.doc.querySelector('form[action*="import"]') || cfg.doc.querySelector('#region-main form');
+    if (!form) throw new Error('formulário de importação não encontrado');
+
+    const dados = new FormData();
+    form.querySelectorAll('input[type="hidden"]').forEach((i) => { if (i.name) dados.set(i.name, i.value); });
+    dados.set('category', opcao.value);
+    dados.delete('cat');
+    dados.set('format', CONFIG.formato);
+    if (CONFIG.categoriaDoArquivo) dados.set('catfromfile', 1);
+    if (CONFIG.contextoDoArquivo) dados.set('contextfromfile', 1);
+    dados.set('matchgrades', CONFIG.notasProximas ? 'nearest' : 'error');
+    dados.set('stoponerror', CONFIG.pararNoErro);
+    dados.set('newfile', cfg.itemid);
+    dados.set('submitbutton', 'Importar');
+
+    const acao = abs(form.getAttribute('action') || cfg.url);
+    const resp = await fetch(acao, { method: 'POST', credentials: 'same-origin', body: dados });
+    const html = await resp.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const erro = [...doc.querySelectorAll('.errorbox, .alert-danger, .invalid-feedback, .error')]
+      .map(txt).filter(Boolean).slice(0, 2).join(' / ');
+    if (erro) throw new Error(`o Moodle recusou: ${erro}`);
+
+    const sucesso = !!doc.querySelector('a[href*="/question/edit.php"], form[action*="/question/edit.php"]');
+    if (!sucesso) throw new Error('a importação não confirmou (sem botão de continuar na resposta)');
+
+    // O Moodle costuma dizer quantas questões entraram; devolve isso para o log quando existir
+    const m = html.replace(/<[^>]+>/g, ' ').match(/(\d+)\s+quest(?:ões|oes|ions)/i);
+    return m ? `${m[1]} questões` : 'ok';
+  }
+
+  // ----------------------------------------------------------------------
+  // Arquivos escolhidos
+  // ----------------------------------------------------------------------
+  let arquivosPorChave = new Map(); // chave do curso -> { AV1: File, AV2: File }
+
+  function analisaNome(nome) {
+    const semExt = nome.replace(/\.[^.]+$/, '');
+    const m = semExt.match(/^(.*?)[\s\-–—]+(AV\s*[12])$/i);
+    if (!m) return null;
+    return { chave: chave(m[1]), secao: m[2].toUpperCase().replace(/\s+/g, '') };
+  }
+
+  function registraArquivos(lista) {
+    arquivosPorChave = new Map();
+    let ignorados = 0;
+    for (const arq of lista) {
+      const info = analisaNome(arq.name);
+      if (!info) { ignorados++; continue; }
+      if (!arquivosPorChave.has(info.chave)) arquivosPorChave.set(info.chave, {});
+      arquivosPorChave.get(info.chave)[info.secao] = arq;
+    }
+    log(`${lista.length} arquivo(s) selecionado(s): ${arquivosPorChave.size} matéria(s) reconhecida(s)` +
+        (ignorados ? `, ${ignorados} sem sufixo AV1/AV2 (ignorados)` : ''));
+  }
+
+  // ----------------------------------------------------------------------
+  // Execução
+  // ----------------------------------------------------------------------
+  let rodando = false, interromper = false, perguntarSempre = true;
+
+  function confirmaMateria(curso, planos, indice, total) {
+    return new Promise((resolve) => {
+      const fundo = document.createElement('div');
+      fundo.style.cssText = `position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);
+        display:flex;align-items:center;justify-content:center;font:13px/1.5 system-ui,sans-serif;`;
+      const caixa = document.createElement('div');
+      caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(500px,92vw);
+        box-shadow:0 12px 40px rgba(0,0,0,.3);`;
+
+      const lista = planos.map((p) =>
+        `<li><code>${p.arquivo.name}</code><br>→ ${p.destino}</li>`).join('');
+      caixa.innerHTML = `
+        <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Matéria ${indice} de ${total}</div>
+        <div style="font-size:15px;font-weight:600;margin:4px 0 10px;">${curso.nome}</div>
+        <div style="color:#333;">Vou importar para o banco desta sala:</div>
+        <ul style="margin:6px 0 12px 18px;padding:0;color:#333;">${lista}</ul>
+        <div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;padding:8px;color:#6b4e00;margin-bottom:12px;">
+          A importação não tem desfazer: as questões são criadas na categoria de destino.
+        </div>
+        <label style="display:flex;gap:6px;align-items:center;color:#555;margin-bottom:14px;">
+          <input type="checkbox" id="ugb-nao-perguntar"> Importar as próximas sem perguntar
+        </label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="ugb-parar" style="padding:8px 12px;border:0;border-radius:5px;background:#b3261e;color:#fff;cursor:pointer;">Parar tudo</button>
+          <button id="ugb-pular" style="padding:8px 12px;border:1px solid #ccd;border-radius:5px;background:#fff;color:#333;cursor:pointer;">Pular esta</button>
+          <button id="ugb-importar" style="padding:8px 12px;border:0;border-radius:5px;background:#28a745;color:#fff;cursor:pointer;">Importar</button>
+        </div>`;
+
+      fundo.appendChild(caixa);
+      document.body.appendChild(fundo);
+      caixa.querySelector('#ugb-importar').focus();
+
+      const responde = (r) => {
+        if (r === 'importar' && caixa.querySelector('#ugb-nao-perguntar').checked) perguntarSempre = false;
+        document.removeEventListener('keydown', tecla);
+        fundo.remove();
+        resolve(r);
+      };
+      const tecla = (e) => { if (e.key === 'Escape') responde('pular'); };
+      caixa.querySelector('#ugb-importar').onclick = () => responde('importar');
+      caixa.querySelector('#ugb-pular').onclick = () => responde('pular');
+      caixa.querySelector('#ugb-parar').onclick = () => responde('parar');
+      fundo.onclick = (e) => { if (e.target === fundo) responde('pular'); };
+      document.addEventListener('keydown', tecla);
+    });
+  }
+
+  async function montaPlano(curso, cfg) {
+    const arquivos = arquivosPorChave.get(chave(curso.nome));
+    if (!arquivos) return { erro: 'nenhum arquivo com nome equivalente' };
+
+    const planos = [];
+    const faltando = [];
+    for (const regex of CONFIG.categorias) {
+      const rotulo = regex.source.match(/AV\d/i) ? regex.source.match(/AV\d/i)[0].toUpperCase() : null;
+      const arquivo = rotulo ? arquivos[rotulo] : null;
+      if (!arquivo) { faltando.push(`${rotulo || regex.source}: sem arquivo`); continue; }
+      const opcao = achaOpcao(cfg.doc, regex);
+      if (!opcao) { faltando.push(`${rotulo}: categoria não existe no destino`); continue; }
+      planos.push({ arquivo, regex, valor: opcao.value, destino: txt(opcao) });
+    }
+    return { planos, faltando };
+  }
+
+  async function executar(somenteTestar) {
+    if (rodando) return;
+    if (!arquivosPorChave.size) { log('Escolha os arquivos XML primeiro.', 'erro'); return; }
+    rodando = true; interromper = false; perguntarSempre = true;
+    travaBotoes(true); botaoParar.style.display = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} cursos nesta categoria.`);
+      let importados = 0, pulados = 0, semBanco = 0, semArquivo = 0, erros = 0;
+
+      for (let i = 0; i < cursos.length; i++) {
+        const curso = cursos[i];
+        if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+        log(`— ${curso.nome}`);
+
+        try {
+          if (!arquivosPorChave.has(chave(curso.nome))) {
+            log('   sem arquivo correspondente', 'aviso'); semArquivo++; continue;
+          }
+
+          const { link, nomes } = await localizaBanco(curso.id, null);
+          if (!link) {
+            log(`   banco não encontrado${nomes && nomes.length ? ` — o curso tem: ${nomes.join(' | ')}` : ''}`, 'aviso');
+            semBanco++; continue;
+          }
+
+          const cfg = await paginaImportacao(link, curso.id, null);
+          if (!cfg) { log('   página de importação não encontrada', 'aviso'); semBanco++; continue; }
+
+          const { planos, faltando } = await montaPlano(curso, cfg);
+          (faltando || []).forEach((f) => log(`   ${f}`, 'aviso'));
+          if (!planos || !planos.length) continue;
+
+          if (somenteTestar) {
+            planos.forEach((p) => log(`   ok: ${p.arquivo.name} → ${p.destino}`));
+            continue;
+          }
+
+          const resposta = perguntarSempre
+            ? await confirmaMateria(curso, planos, i + 1, cursos.length)
+            : 'importar';
+          if (resposta === 'parar') { log('Interrompido por você.', 'aviso'); break; }
+          if (resposta === 'pular') { log('   pulada', 'aviso'); pulados++; continue; }
+
+          for (const plano of planos) {
+            if (interromper) break;
+            // Cada arquivo precisa de uma área de rascunho nova, senão o Moodle
+            // pode reaproveitar o arquivo anterior que ficou lá.
+            const cfgNovo = await paginaImportacao(link, curso.id, null);
+            if (!cfgNovo) throw new Error('não consegui reabrir a página de importação');
+
+            const opcao =
+              [...cfgNovo.doc.querySelectorAll('select[name="category"] option')]
+                .find((o) => o.value === plano.valor) || achaOpcao(cfgNovo.doc, plano.regex);
+            if (!opcao) throw new Error(`categoria ${plano.destino} não apareceu na segunda leitura`);
+
+            const resultado = await importa(cfgNovo, opcao, plano.arquivo);
+            log(`   importado: ${plano.arquivo.name} → ${plano.destino} (${resultado})`, 'ok');
+            importados++;
+            await dorme(CONFIG.pausaMs);
+          }
+        } catch (e) {
+          log(`   erro: ${e.message}`, 'erro');
+          erros++;
+        }
+        await dorme(CONFIG.pausaMs);
+      }
+
+      log(`Fim. ${importados} importações, ${pulados} puladas, ${semArquivo} sem arquivo, ${semBanco} sem banco, ${erros} erros.`);
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false; perguntarSempre = true;
+      travaBotoes(false); botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // Lê a quantidade de questões que o Moodle mostra ao lado do nome da categoria: "AV1 (22)"
+  function contaQuestoes(texto) {
+    const m = texto.match(/\((\d+)\)\s*$/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+
+  async function varreduraBancos(cursos) {
+    log('');
+    log('Situação dos bancos nesta categoria:');
+    const vazios = [], parciais = [], semBanco = [];
+
+    for (const curso of cursos) {
+      if (interromper) { log('Varredura interrompida.', 'aviso'); break; }
+      const curto = curso.nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*⬩.*$/, '').trim();
+
+      try {
+        const { link } = await localizaBanco(curso.id, null);
+        if (!link) { log(`   ${curto}: sem banco`, 'erro'); semBanco.push(curto); continue; }
+
+        const cfg = await paginaImportacao(link, curso.id, null);
+        if (!cfg) { log(`   ${curto}: banco sem página de importação`, 'erro'); semBanco.push(curto); continue; }
+
+        const partes = [];
+        let total = 0, encontradas = 0;
+        for (const regex of CONFIG.categorias) {
+          const rotulo = (regex.source.match(/AV\d/i) || ['?'])[0].toUpperCase();
+          const opcao = achaOpcao(cfg.doc, regex);
+          if (!opcao) { partes.push(`${rotulo}: não existe`); continue; }
+          encontradas++;
+          const n = contaQuestoes(txt(opcao));
+          partes.push(`${rotulo}: ${n === null ? '?' : n}`);
+          total += n || 0;
+        }
+
+        const estado = total === 0 ? 'vazio' : (encontradas < CONFIG.categorias.length || partes.some((p) => /: 0$/.test(p)) ? 'incompleto' : 'ok');
+        log(`   ${curto}: ${partes.join(' · ')} → ${estado}`, estado === 'ok' ? 'ok' : 'aviso');
+        if (estado === 'vazio') vazios.push(curto);
+        else if (estado === 'incompleto') parciais.push(curto);
+      } catch (e) {
+        log(`   ${curto}: erro ao ler (${e.message})`, 'erro');
+      }
+      await dorme(CONFIG.pausaMs);
+    }
+
+    log('');
+    log(`Vazios (${vazios.length}): ${vazios.join(' | ') || '—'}`, vazios.length ? 'aviso' : 'ok');
+    log(`Incompletos (${parciais.length}): ${parciais.join(' | ') || '—'}`, parciais.length ? 'aviso' : 'ok');
+    if (semBanco.length) log(`Sem banco (${semBanco.length}): ${semBanco.join(' | ')}`, 'erro');
+  }
+
+  async function diagnosticar() {
+    if (rodando) return;
+    rodando = true; interromper = false; travaBotoes(true); botaoParar.style.display = '';
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} cursos na categoria.`);
+      if (!cursos.length) return;
+      const curso = cursos[0];
+      log(`Testando: ${curso.nome} (id ${curso.id})`);
+      log(`Chave do curso: ${chave(curso.nome)}`);
+
+      const { link, nomes } = await localizaBanco(curso.id, (m) => log(m));
+      if (!link) { log(`Sem banco. Nomes vistos: ${(nomes || []).join(' | ') || '(nenhum)'}`, 'erro'); return; }
+      log(`Banco: "${link.texto}" — cmid ${link.cmid}`, 'ok');
+
+      const cfg = await paginaImportacao(link, curso.id, (m) => log(m));
+      if (!cfg) { log('Sem página de importação.', 'erro'); return; }
+      if (!cfg.repoId) {
+        const achado = await descobreRepoUpload(cfg.url, (m) => log(m));
+        cfg.repoId = achado.repoId;
+        cfg.ctxId = cfg.ctxId || achado.ctxId;
+      }
+      log(`draftitemid ${cfg.itemid} · repo upload ${cfg.repoId} · contexto ${cfg.ctxId}`, cfg.repoId ? 'ok' : 'erro');
+      if (!cfg.repoId) log('Abra a importação manualmente, veja o id na URL do seletor e ponha em repoIdUpload.', 'aviso');
+
+      const opcoes = [...cfg.doc.querySelectorAll('select[name="category"] option')];
+      log(`Categorias de destino (${opcoes.length}):`);
+      opcoes.slice(0, 20).forEach((o) => log(`   · ${txt(o)}  [${o.value}]`));
+
+      if (arquivosPorChave.size) {
+        const arqs = arquivosPorChave.get(chave(curso.nome));
+        log(arqs ? `Arquivos casados: ${Object.entries(arqs).map(([k, v]) => `${k}=${v.name}`).join(' | ')}`
+                 : 'Nenhum arquivo casou com esta matéria.', arqs ? 'ok' : 'aviso');
+      } else {
+        log('Nenhum arquivo selecionado ainda.', 'aviso');
+      }
+
+      await varreduraBancos(cursos);
+    } catch (e) {
+      log(`Erro: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false;
+      travaBotoes(false); botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // Painel
+  // ----------------------------------------------------------------------
+  const painel = document.createElement('div');
+  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;width:400px;
+    font:12px/1.45 system-ui,sans-serif;background:#fff;border:1px solid #ccd;border-radius:8px;
+    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
+
+  const titulo = document.createElement('div');
+  titulo.textContent = 'Importar bancos AV1/AV2';
+  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
+
+  const entrada = document.createElement('input');
+  entrada.type = 'file';
+  entrada.multiple = true;
+  entrada.accept = '.xml,text/xml';
+  entrada.style.cssText = 'display:block;margin-bottom:8px;width:100%;';
+  entrada.onchange = () => registraArquivos([...entrada.files]);
+
+  const botoes = document.createElement('div');
+  botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+
+  const criaBotao = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoes.appendChild(b);
+    return b;
+  };
+
+  const botao = criaBotao('Importar', '#28a745', () => executar(false));
+  const botaoTeste = criaBotao('Só conferir', '#5a6673', () => executar(true));
+  const botaoDiag = criaBotao('Diagnosticar', '#2d5bd0', diagnosticar);
+  const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
+  botaoParar.style.display = 'none';
+
+  const travaBotoes = (t) => { botao.disabled = botaoTeste.disabled = botaoDiag.disabled = t; };
+
+  const painelLog = document.createElement('div');
+  painelLog.style.cssText = 'margin-top:8px;max-height:340px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+
+  painel.append(titulo, entrada, botoes, painelLog);
+  document.body.appendChild(painel);
+
+  function log(msg, tipo) {
+    const cor = { ok: '#177245', erro: '#b3261e', aviso: '#8a6100' }[tipo] || '#333';
+    const linha = document.createElement('div');
+    linha.style.color = cor;
+    linha.textContent = msg;
+    painelLog.appendChild(linha);
+    painelLog.scrollTop = painelLog.scrollHeight;
+    console.log('[UGB import]', msg);
+  }
+})();
