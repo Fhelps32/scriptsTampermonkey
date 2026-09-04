@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Importar bancos de questões AV1/AV2 (Dependência UGB)
 // @namespace    https://dependencia.ugb.edu.br/
-// @version      1.1
+// @version      1.2
 // @description  Importa os XMLs exportados de um período para os bancos das salas do período novo, com resumo exportável do diagnóstico
 // @author       Você
 // @match        https://dependencia.ugb.edu.br/course/index.php*
@@ -19,6 +19,7 @@
   const CONFIG = {
     banco: /ADP[\s\-_.]*DEP/i,                // nome do banco de destino
     categorias: [/^\s*AV1\b/i, /^\s*AV2\b/i], // categorias de destino
+    minimoQuestoes: 10,                       // abaixo disso a matéria entra na lista de atenção do diagnóstico
     formato: 'xml',
     categoriaDoArquivo: 0,                    // "obter categoria do arquivo" — desmarcado
     contextoDoArquivo: 0,                     // "obter contexto do arquivo" — desmarcado
@@ -559,17 +560,22 @@
         for (const regex of CONFIG.categorias) {
           const rotulo = (regex.source.match(/AV\d/i) || ['?'])[0].toUpperCase();
           const opcao = achaOpcao(cfg.doc, regex);
-          if (!opcao) { partes.push({ rotulo, texto: 'não existe', quantidade: null }); continue; }
+          if (!opcao) { partes.push({ rotulo, texto: 'não existe', quantidade: null, existe: false }); continue; }
           encontradas++;
           const n = contaQuestoes(txt(opcao));
-          partes.push({ rotulo, texto: n === null ? '?' : String(n), quantidade: n });
+          partes.push({ rotulo, texto: n === null ? '?' : String(n), quantidade: n, existe: true });
           total += n || 0;
         }
 
         const estado = total === 0
           ? 'vazio'
           : (encontradas < CONFIG.categorias.length || partes.some((p) => p.quantidade === 0) ? 'incompleto' : 'ok');
-        log(`   ${curto}: ${formataPartes(partes)} → ${estado}`, estado === 'ok' ? 'ok' : 'aviso');
+        const criticas = partes.filter(abaixoDoMinimo);
+        const alerta = criticas.length
+          ? ` · atenção: menos de ${CONFIG.minimoQuestoes} em ${criticas.map((p) => p.rotulo).join('/')}`
+          : '';
+        log(`   ${curto}: ${formataPartes(partes)} → ${estado}${alerta}`,
+            estado === 'ok' && !criticas.length ? 'ok' : 'aviso');
         relatorio.push({ nome: curto, curso, estado, partes, total });
       } catch (e) {
         log(`   ${curto}: erro ao ler (${e.message})`, 'erro');
@@ -589,6 +595,18 @@
   function formataPartes(partes) {
     if (!partes || !partes.length) return 'sem categorias AV1/AV2';
     return partes.map((p) => `${p.rotulo}: ${p.texto}`).join(' · ');
+  }
+
+  // Categoria que não existe no destino conta como abaixo do mínimo (não tem
+  // questão nenhuma). Categoria que existe mas o Moodle não mostrou o número
+  // fica de fora daqui e vai para a lista de "conferir à mão".
+  function abaixoDoMinimo(p) {
+    if (p.existe === false) return true;
+    return p.quantidade != null && p.quantidade < CONFIG.minimoQuestoes;
+  }
+
+  function semContagem(p) {
+    return p.existe !== false && p.quantidade == null;
   }
 
   function nomeCategoria() {
@@ -640,6 +658,24 @@
     bloco('SEM BANCO DE QUESTÕES', semBanco, false);
     if (erros.length) bloco('NÃO FOI POSSÍVEL VERIFICAR', erros, false);
 
+    const alertas = relatorio
+      .map((r) => ({ r, criticas: (r.partes || []).filter(abaixoDoMinimo) }))
+      .filter((x) => x.criticas.length);
+    linhas.push(`ATENÇÃO — MATÉRIAS COM MENOS DE ${CONFIG.minimoQuestoes} QUESTÕES (${alertas.length})`);
+    if (!alertas.length) linhas.push('  —');
+    alertas.forEach(({ r, criticas }) =>
+      linhas.push(`  - ${r.nome} — ${formataPartes(criticas)}`));
+
+    const duvidosas = relatorio
+      .map((r) => ({ r, sem: (r.partes || []).filter(semContagem) }))
+      .filter((x) => x.sem.length);
+    if (duvidosas.length) {
+      linhas.push(`  sem contagem visível no Moodle, confira à mão (${duvidosas.length}):`);
+      duvidosas.forEach(({ r, sem }) =>
+        linhas.push(`    - ${r.nome} — ${sem.map((p) => p.rotulo).join(' · ')}`));
+    }
+    linhas.push('');
+
     const detalhePorCategoria = porCategoria.size
       ? ` (${[...porCategoria].map(([rotulo, n]) => `${rotulo}: ${n}`).join(' · ')})`
       : '';
@@ -653,7 +689,8 @@
     for (const linha of textoResumo().split('\n')) {
       const tipo = /^BANCOS COMPLETOS/.test(linha)
         ? 'ok'
-        : (/^(BANCOS INCOMPLETOS|BANCOS VAZIOS|SEM BANCO|NÃO FOI POSS)/.test(linha) ? 'erro' : undefined);
+        : (/^ATENÇÃO/.test(linha) ? 'aviso'
+          : (/^(BANCOS INCOMPLETOS|BANCOS VAZIOS|SEM BANCO|NÃO FOI POSS)/.test(linha) ? 'erro' : undefined));
       log(linha, tipo);
     }
   }
