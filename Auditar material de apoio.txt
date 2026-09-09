@@ -309,8 +309,27 @@
       doc.querySelector('#region-main table.generaltable') ||
       doc.querySelector('table.generaltable');
     if (!tabela) return [];
-    return [...tabela.querySelectorAll('tbody tr')]
-      .filter((tr) => tr.querySelector('a[href*="/user/view.php"], a[href*="/user/profile.php"]'));
+    return [...tabela.querySelectorAll('tbody tr')].filter((tr) => linksDeParticipante(tr).length);
+  }
+
+  // O avatar do participante é um link para o perfil igual ao do nome, e
+  // quando o usuário não tem foto o Moodle desenha as iniciais como TEXTO
+  // ("FD"). Sem tirar isso, o "nome" do professor viraria as iniciais — e dois
+  // professores sem foto virariam um só.
+  const SELETOR_AVATAR = '.userpicture, .userinitials, .avatar, .initials, img, svg';
+
+  function linksDeParticipante(linha) {
+    return [...linha.querySelectorAll('a[href*="/user/view.php"], a[href*="/user/profile.php"]')];
+  }
+
+  function nomeDoParticipante(linha) {
+    for (const link of linksDeParticipante(linha)) {
+      const clone = link.cloneNode(true);
+      clone.querySelectorAll(SELETOR_AVATAR).forEach((n) => n.remove());
+      const nome = txt(clone);
+      if (nome) return nome;
+    }
+    return '';
   }
 
   function ehPapelProfessor(papel) {
@@ -318,41 +337,65 @@
     return !!n && CONFIG.papeisProfessor.some((re) => re.test(n));
   }
 
-  // Textos de controle e de leitor de tela que ficam grudados na célula de
-  // papéis ("Papéis", "Editar papéis") e estragariam a comparação exata.
+  // Ícones e textos de leitor de tela que ficam grudados no nome do papel
+  // ("Papéis", "Editar papéis", o lápis de edição) e estragariam a comparação
+  // exata. Atenção: NÃO dá para remover os links aqui — no "inplace editable"
+  // do Moodle o nome do papel fica dentro do próprio link de edição.
   const SELETOR_CONTROLES_CELULA =
-    '.sr-only, .sr-only-focusable, .accesshide, .visually-hidden, button, [role="button"], ' +
-    'a[href], input, select, .action-menu, .dropdown, .menu, [data-action]';
+    '.quickediticon, .editinstructions, img, i.icon, .sr-only, .sr-only-focusable, ' +
+    '.accesshide, .visually-hidden, button, input, select, .action-menu, .dropdown, .menu';
 
-  // Devolve os papéis do participante, um por elemento. Os temas mais novos
-  // põem cada papel num badge/li; os antigos jogam tudo num texto só,
-  // separado por vírgula — por isso os dois caminhos.
+  // Devolve os papéis do participante, um por item da lista.
+  // A coluna "Papéis" aparece em três formatos, dependendo da versão/tema:
+  //   1. inplace editable — <span class="displayvalue">Professor</span> dentro
+  //      do link do lápis (é o formato do Moodle 4.x/5 em uso aqui);
+  //   2. um badge/li por papel;
+  //   3. texto solto, com os papéis separados por vírgula.
   function papeisDaCelula(celula) {
     const clone = celula.cloneNode(true);
     clone.querySelectorAll(SELETOR_CONTROLES_CELULA).forEach((n) => n.remove());
-    const marcados = [...clone.querySelectorAll('.badge, li, .role, [data-value]')]
-      .map((n) => txt(n))
+
+    const editaveis = [...clone.querySelectorAll('.displayvalue')];
+    const marcados = editaveis.length ? editaveis : [...clone.querySelectorAll('.badge, li, .role')];
+    const textos = marcados.length ? marcados.map((n) => txt(n)) : [txt(clone)];
+
+    return textos
+      .flatMap((t) => t.split(/[,;\n\u00b7|]+/))
+      .map((t) => t.trim())
       .filter(Boolean);
-    if (marcados.length) return marcados;
-    return txt(clone).split(/[,;\n\u00b7|]+/);
   }
 
-  function celulaTemProfessor(celula) {
-    return papeisDaCelula(celula).some(ehPapelProfessor);
-  }
-
+  // Além dos nomes, devolvo os papéis que apareceram na tabela: quando nenhum
+  // professor é encontrado, é isso que mostra se o problema foi a leitura da
+  // página ou se a sala realmente não tem ninguém com o papel esperado.
   function extraiProfessores(linhas) {
     const nomes = [];
+    const papeisVistos = new Set();
     for (const linha of linhas) {
-      const link = linha.querySelector('a[href*="/user/view.php"], a[href*="/user/profile.php"]');
-      const nome = txt(link);
+      const nome = nomeDoParticipante(linha);
       if (!nome) continue;
-      const celulaDoNome = link.closest('td, th');
-      const celulas = [...linha.querySelectorAll('td, th')].filter((c) => c !== celulaDoNome);
-      if (!celulas.some(celulaTemProfessor)) continue;
+      const celulasDoNome = linksDeParticipante(linha).map((a) => a.closest('td, th'));
+      const celulas = [...linha.querySelectorAll('td, th')].filter((c) => !celulasDoNome.includes(c));
+
+      let ehProfessor = false;
+      for (const celula of celulas) {
+        for (const papel of papeisDaCelula(celula)) {
+          if (!ehPapelProfessor(papel)) continue;
+          ehProfessor = true;
+          papeisVistos.add(papel);
+        }
+      }
+      if (!ehProfessor) {
+        const celulaPapeis = celulas.find((c) => c.querySelector('[data-itemtype="user_roles"], [data-region="roles"]'));
+        if (celulaPapeis) papeisDaCelula(celulaPapeis).forEach((p) => papeisVistos.add(p));
+        continue;
+      }
       if (!nomes.includes(nome)) nomes.push(nome);
     }
-    return nomes.sort((a, b) => a.localeCompare(b, 'pt'));
+    return {
+      nomes: nomes.sort((a, b) => a.localeCompare(b, 'pt')),
+      papeisVistos: [...papeisVistos],
+    };
   }
 
   // Devolve { nomes, lido }: "lido" separa "a sala não tem professor" de
@@ -363,22 +406,23 @@
     let doc = r.doc;
     let linhas = linhasParticipantes(doc);
 
-    // Só recorro ao iframe quando a página nem parece a de participantes: se a
-    // tabela veio vazia de verdade, esperar pelo JavaScript só gastaria tempo.
-    if (!linhas.length && !temTabelaParticipantes(doc) && CONFIG.usarIframe) {
+    // Sem nenhuma linha, tento de novo dentro de um iframe: em parte das
+    // versões a tabela de participantes só é montada por JavaScript.
+    if (!linhas.length && CONFIG.usarIframe) {
       const comJs = await carregaComJs(url, (d) => linhasParticipantes(d).length > 0);
-      if (comJs) { doc = comJs; linhas = linhasParticipantes(comJs); }
+      if (comJs && linhasParticipantes(comJs).length) { doc = comJs; linhas = linhasParticipantes(comJs); }
     }
 
-    if (!linhas.length && !temTabelaParticipantes(doc)) return { nomes: [], lido: false };
-    return { nomes: extraiProfessores(linhas), lido: true };
+    if (!linhas.length) return { nomes: [], papeisVistos: [], lido: temTabelaParticipantes(doc) };
+    return { ...extraiProfessores(linhas), lido: true };
   }
 
   function textoProfessores(r) {
-    const p = (r && r.professores) || { nomes: [], lido: false };
+    const p = (r && r.professores) || { nomes: [], papeisVistos: [], lido: false };
     if (!p.lido) return 'não foi possível ler os participantes';
-    if (!p.nomes.length) return 'sem professor atribuído';
-    return p.nomes.join(', ');
+    if (p.nomes.length) return p.nomes.join(', ');
+    const vistos = (p.papeisVistos || []).join(', ');
+    return vistos ? `sem professor atribuído (papéis na sala: ${vistos})` : 'sem professor atribuído';
   }
 
   async function leCurso(curso) {
@@ -393,7 +437,7 @@
 
     const professores = CONFIG.mostrarProfessores
       ? await listaProfessores(curso.id)
-      : { nomes: [], lido: false };
+      : { nomes: [], papeisVistos: [], lido: false };
 
     const ignoradas = brutas.filter((s) => ehSecaoIgnorada(s.nome));
     const secoes = brutas.filter((s) => !ehSecaoIgnorada(s.nome));
@@ -480,7 +524,7 @@
           log(`${curto}: erro ao ler (${e.message})`, 'erro');
           relatorio.push({
             curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro',
-            secoes: [], seguePadrao: false, professores: { nomes: [], lido: false },
+            secoes: [], seguePadrao: false, professores: { nomes: [], papeisVistos: [], lido: false },
           });
         }
         await dorme(CONFIG.pausaMs);
