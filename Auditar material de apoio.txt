@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auditar material de apoio (NEAD UGB)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.0
-// @description  Verifica se cada sala da categoria tem conteúdo em QUALQUER seção, e resume quais têm material e quais estão vazias
+// @version      2.1
+// @description  Verifica se cada sala da categoria tem conteúdo em QUALQUER seção, resume quais têm material, quais estão vazias e quem é o professor de cada uma
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @icon         https://nead.ugb.edu.br/favicon.ico
@@ -30,6 +30,14 @@
     // existam na seção. Se só sobrar isso numa seção, ela é tratada como vazia.
     // Nomes técnicos do Moodle (o que vem depois de "modtype_" na classe do item).
     tiposIgnorados: ['forum'],
+    // Professor da sala: lido na página de participantes do curso.
+    mostrarProfessores: true,
+    // Papéis que contam como professor. A comparação é feita sem acento, em
+    // maiúsculas e sobre cada papel isoladamente, então /^PROFESSOR$/ casa com
+    // "Professor" mas não com "Professor não editor" nem com "Tutor".
+    // Para incluir outros papéis, acrescente aqui (ex.: /^PROFESSOR NAO EDITOR$/).
+    papeisProfessor: [/^PROFESSOR(A)?$/],
+    participantesPorPagina: 200,
     pausaMs: 600,
     usarIframe: true,                 // fallback quando a página do curso é montada por JS
     esperaIframeMs: 12000,
@@ -286,6 +294,93 @@
     });
   }
 
+  // ----------------------------------------------------------------------
+  // Professores da sala (página de participantes do curso)
+  // ----------------------------------------------------------------------
+  function temTabelaParticipantes(doc) {
+    return !!doc && !!doc.querySelector('#participants, #participantsform, table#participants, [data-table-uniqueid*="participants"]');
+  }
+
+  function linhasParticipantes(doc) {
+    if (!doc) return [];
+    const tabela =
+      doc.querySelector('table#participants') ||
+      doc.querySelector('#participantsform table') ||
+      doc.querySelector('#region-main table.generaltable') ||
+      doc.querySelector('table.generaltable');
+    if (!tabela) return [];
+    return [...tabela.querySelectorAll('tbody tr')]
+      .filter((tr) => tr.querySelector('a[href*="/user/view.php"], a[href*="/user/profile.php"]'));
+  }
+
+  function ehPapelProfessor(papel) {
+    const n = norm(papel);
+    return !!n && CONFIG.papeisProfessor.some((re) => re.test(n));
+  }
+
+  // Textos de controle e de leitor de tela que ficam grudados na célula de
+  // papéis ("Papéis", "Editar papéis") e estragariam a comparação exata.
+  const SELETOR_CONTROLES_CELULA =
+    '.sr-only, .sr-only-focusable, .accesshide, .visually-hidden, button, [role="button"], ' +
+    'a[href], input, select, .action-menu, .dropdown, .menu, [data-action]';
+
+  // Devolve os papéis do participante, um por elemento. Os temas mais novos
+  // põem cada papel num badge/li; os antigos jogam tudo num texto só,
+  // separado por vírgula — por isso os dois caminhos.
+  function papeisDaCelula(celula) {
+    const clone = celula.cloneNode(true);
+    clone.querySelectorAll(SELETOR_CONTROLES_CELULA).forEach((n) => n.remove());
+    const marcados = [...clone.querySelectorAll('.badge, li, .role, [data-value]')]
+      .map((n) => txt(n))
+      .filter(Boolean);
+    if (marcados.length) return marcados;
+    return txt(clone).split(/[,;\n\u00b7|]+/);
+  }
+
+  function celulaTemProfessor(celula) {
+    return papeisDaCelula(celula).some(ehPapelProfessor);
+  }
+
+  function extraiProfessores(linhas) {
+    const nomes = [];
+    for (const linha of linhas) {
+      const link = linha.querySelector('a[href*="/user/view.php"], a[href*="/user/profile.php"]');
+      const nome = txt(link);
+      if (!nome) continue;
+      const celulaDoNome = link.closest('td, th');
+      const celulas = [...linha.querySelectorAll('td, th')].filter((c) => c !== celulaDoNome);
+      if (!celulas.some(celulaTemProfessor)) continue;
+      if (!nomes.includes(nome)) nomes.push(nome);
+    }
+    return nomes.sort((a, b) => a.localeCompare(b, 'pt'));
+  }
+
+  // Devolve { nomes, lido }: "lido" separa "a sala não tem professor" de
+  // "não consegui abrir a lista de participantes" (sem permissão, erro etc.).
+  async function listaProfessores(courseid) {
+    const url = `${ORIGEM}/user/index.php?id=${courseid}&perpage=${CONFIG.participantesPorPagina}`;
+    const r = await baixaPagina(url);
+    let doc = r.doc;
+    let linhas = linhasParticipantes(doc);
+
+    // Só recorro ao iframe quando a página nem parece a de participantes: se a
+    // tabela veio vazia de verdade, esperar pelo JavaScript só gastaria tempo.
+    if (!linhas.length && !temTabelaParticipantes(doc) && CONFIG.usarIframe) {
+      const comJs = await carregaComJs(url, (d) => linhasParticipantes(d).length > 0);
+      if (comJs) { doc = comJs; linhas = linhasParticipantes(comJs); }
+    }
+
+    if (!linhas.length && !temTabelaParticipantes(doc)) return { nomes: [], lido: false };
+    return { nomes: extraiProfessores(linhas), lido: true };
+  }
+
+  function textoProfessores(r) {
+    const p = (r && r.professores) || { nomes: [], lido: false };
+    if (!p.lido) return 'não foi possível ler os participantes';
+    if (!p.nomes.length) return 'sem professor atribuído';
+    return p.nomes.join(', ');
+  }
+
   async function leCurso(curso) {
     const url = `${ORIGEM}/course/view.php?id=${curso.id}`;
     const r = await baixaPagina(url);
@@ -296,9 +391,13 @@
       brutas = achaSecoes(doc);
     }
 
+    const professores = CONFIG.mostrarProfessores
+      ? await listaProfessores(curso.id)
+      : { nomes: [], lido: false };
+
     const ignoradas = brutas.filter((s) => ehSecaoIgnorada(s.nome));
     const secoes = brutas.filter((s) => !ehSecaoIgnorada(s.nome));
-    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome) };
+    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome), professores };
   }
 
   // ----------------------------------------------------------------------
@@ -325,7 +424,11 @@
     else if (comConteudo.length) estado = 'com conteúdo';
     else estado = 'sem conteúdo';
 
-    return { curso, url: leitura.url, secoes, estado, seguePadrao, ignoradas: leitura.ignoradas || [] };
+    return {
+      curso, url: leitura.url, secoes, estado, seguePadrao,
+      ignoradas: leitura.ignoradas || [],
+      professores: leitura.professores || { nomes: [], lido: false },
+    };
   }
 
   // ----------------------------------------------------------------------
@@ -356,6 +459,8 @@
           const tipo = r.estado === 'com conteúdo' ? 'ok' : (r.estado === 'ilegível' ? 'erro' : 'aviso');
           log(curto, tipo);
 
+          if (CONFIG.mostrarProfessores) log(`   Professor(es): ${textoProfessores(r)}`);
+
           if (r.ignoradas.length) log(`   (ignorando: ${r.ignoradas.join(' | ')})`);
 
           if (r.secoes.length) {
@@ -373,7 +478,10 @@
           log(`   → ${r.estado}${r.seguePadrao ? ' · estrutura padrão' : ''}`, tipo);
         } catch (e) {
           log(`${curto}: erro ao ler (${e.message})`, 'erro');
-          relatorio.push({ curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro', secoes: [], seguePadrao: false });
+          relatorio.push({
+            curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro',
+            secoes: [], seguePadrao: false, professores: { nomes: [], lido: false },
+          });
         }
         await dorme(CONFIG.pausaMs);
       }
@@ -390,6 +498,13 @@
 
   function nomeCurto(curso) {
     return curso.nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+  }
+
+  // Uma linha por sala no resumo, já com o(s) professor(es) da matéria.
+  function linhaSala(indentacao, r) {
+    const nome = nomeCurto(r.curso);
+    if (!CONFIG.mostrarProfessores) return `${indentacao}- ${nome}`;
+    return `${indentacao}- ${nome} — Professor(es): ${textoProfessores(r)}`;
   }
 
   function linhasDetalheSala(r) {
@@ -410,19 +525,19 @@
     linhas.push(`SALAS COM CONTEÚDO (${comConteudo.length})`);
     if (padrao.length) {
       linhas.push(`  estrutura padrão (${padrao.length}):`);
-      padrao.forEach((r) => { linhas.push(`    - ${nomeCurto(r.curso)}`); linhas.push(...linhasDetalheSala(r)); });
+      padrao.forEach((r) => { linhas.push(linhaSala('    ', r)); linhas.push(...linhasDetalheSala(r)); });
     }
     if (foraPadrao.length) {
       linhas.push(`  fora do padrão, mas com material (${foraPadrao.length}):`);
-      foraPadrao.forEach((r) => { linhas.push(`    - ${nomeCurto(r.curso)}`); linhas.push(...linhasDetalheSala(r)); });
+      foraPadrao.forEach((r) => { linhas.push(linhaSala('    ', r)); linhas.push(...linhasDetalheSala(r)); });
     }
     linhas.push('');
     linhas.push(`SALAS SEM CONTEÚDO (${semConteudo.length})`);
-    semConteudo.forEach((r) => linhas.push(`  - ${nomeCurto(r.curso)}`));
+    semConteudo.forEach((r) => linhas.push(linhaSala('  ', r)));
     if (ilegiveis.length) {
       linhas.push('');
       linhas.push(`NÃO FOI POSSÍVEL VERIFICAR (${ilegiveis.length})`);
-      ilegiveis.forEach((r) => linhas.push(`  - ${nomeCurto(r.curso)}`));
+      ilegiveis.forEach((r) => linhas.push(linhaSala('  ', r)));
     }
     return linhas.join('\n');
   }
