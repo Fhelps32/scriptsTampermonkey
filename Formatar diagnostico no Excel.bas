@@ -41,8 +41,8 @@ End Function
 Public Sub FormatarDiagnosticoBancos()
     Dim ws As Worksheet
     Dim linhaCab As Long, ultLin As Long, ultCol As Long
-    Dim colSituacao As Long, colTotal As Long, colUrl As Long
-    Dim colObs As Long, colBanco As Long, colMateria As Long
+    Dim colSituacao As Long, colUrl As Long
+    Dim colObs As Long, colMateria As Long
 
     Set ws = ActiveSheet
 
@@ -78,20 +78,18 @@ Public Sub FormatarDiagnosticoBancos()
     End If
 
     colMateria = ColunaPorNome(ws, linhaCab, ultCol, "Matéria")
-    colBanco = ColunaPorNome(ws, linhaCab, ultCol, "Banco")
-    colTotal = ColunaPorNome(ws, linhaCab, ultCol, "Total")
     colSituacao = ColunaPorNome(ws, linhaCab, ultCol, "Situação")
     colUrl = ColunaPorNome(ws, linhaCab, ultCol, "URL")
     colObs = ColunaPorNome(ws, linhaCab, ultCol, "Observações")
 
     LimpaFormatacaoAntiga ws
     FormataCorpo ws, linhaCab, ultLin, ultCol
-    FormataColunas ws, linhaCab, ultLin, ultCol, colBanco, colTotal, colSituacao, colUrl, colObs
+    FormataColunas ws, linhaCab, ultLin, ultCol, colSituacao, colUrl, colObs
     AjustaAlturas ws, linhaCab, ultLin
     PintaPorSituacao ws, linhaCab, ultLin, ultCol, colSituacao
     TransformaUrlsEmLinks ws, linhaCab, ultLin, colUrl
     Dim linhaTotais As Long
-    linhaTotais = EscreveLinhaDeTotais(ws, linhaCab, ultLin, ultCol, colBanco, colTotal)
+    linhaTotais = EscreveLinhaDeTotais(ws, linhaCab, ultLin, ultCol)
     EscreveTitulo ws, linhaCab, ultLin, ultCol, colSituacao
     ' O título ocupou 3 linhas: tudo desceu.
     linhaCab = linhaCab + 3
@@ -234,15 +232,14 @@ Private Sub FormataCabecalho(ws As Worksheet, linhaCab As Long, ultCol As Long)
 End Sub
 
 Private Sub FormataColunas(ws As Worksheet, linhaCab As Long, ultLin As Long, ultCol As Long, _
-                           colBanco As Long, colTotal As Long, colSituacao As Long, _
-                           colUrl As Long, colObs As Long)
+                           colSituacao As Long, colUrl As Long, colObs As Long)
     Dim c As Long
     Dim corpo As Range
 
     For c = 1 To ultCol
         Set corpo = ws.Range(ws.Cells(linhaCab + 1, c), ws.Cells(ultLin, c))
 
-        If colTotal > 0 And colBanco > 0 And c > colBanco And c <= colTotal Then
+        If EhColunaDeContagem(CStr(ws.Cells(linhaCab, c).Value)) Then
             ' Contagens de questões e o total: número, centralizado.
             corpo.HorizontalAlignment = xlCenter
             corpo.NumberFormat = "0"
@@ -318,21 +315,21 @@ Private Sub TransformaUrlsEmLinks(ws As Worksheet, linhaCab As Long, ultLin As L
 End Sub
 
 Private Function EscreveLinhaDeTotais(ws As Worksheet, linhaCab As Long, ultLin As Long, _
-                                      ultCol As Long, colBanco As Long, colTotal As Long) As Long
+                                      ultCol As Long) As Long
     Dim linha As Long, c As Long
     Dim letra As String
 
     linha = ultLin + 1
     ws.Cells(linha, 1).Value = "TOTAL (" & (ultLin - linhaCab) & " salas)"
 
-    If colTotal > 0 And colBanco > 0 Then
-        For c = colBanco + 1 To colTotal
+    For c = 1 To ultCol
+        If EhColunaDeContagem(CStr(ws.Cells(linhaCab, c).Value)) Then
             letra = LetraColuna(ws, c)
             ws.Cells(linha, c).Formula = "=SUM(" & letra & linhaCab + 1 & ":" & letra & ultLin & ")"
             ws.Cells(linha, c).HorizontalAlignment = xlCenter
             ws.Cells(linha, c).NumberFormat = "0"
-        Next c
-    End If
+        End If
+    Next c
 
     With ws.Range(ws.Cells(linha, 1), ws.Cells(linha, ultCol))
         .Font.Bold = True
@@ -481,6 +478,24 @@ End Sub
 '==============================================================================
 ' Utilidades
 '==============================================================================
+
+' As colunas de contagem são as de categoria (AV1, AV2, Final…) e o "Total".
+' Em vez de procurá-las por posição — que muda toda vez que uma coluna sai do
+' CSV —, listo as que NÃO são: o que sobrar é contagem.
+Private Function EhColunaDeContagem(nome As String) As Boolean
+    Dim n As String
+    n = Trim$(nome)
+    If Len(n) = 0 Then Exit Function
+    If LCase$(Left$(n, 7)) = "arquivo" Then Exit Function
+
+    Select Case LCase$(n)
+        Case "matéria", "materia", "curso", "url", "banco", "id", "cmid", _
+             "situação", "situacao", "observações", "observacoes"
+            EhColunaDeContagem = False
+        Case Else
+            EhColunaDeContagem = True
+    End Select
+End Function
 
 Private Function LetraColuna(ws As Worksheet, col As Long) As String
     LetraColuna = Split(ws.Cells(1, col).Address(True, False), "$")(0)

@@ -26,6 +26,12 @@
     pararNoErro: 1,
     pausaMs: 1000,
     // Resultado do diagnóstico
+    // Em que nível da trilha de categorias está o nome do curso, contando a
+    // partir do primeiro nível abaixo de "Cursos". Na estrutura do NEAD:
+    //   Cursos / 2026.2 / Campus Volta Redonda / Engenharia Civil / Com Avaliação
+    //              1º             2º                    3º                4º
+    // ou seja, o curso é o 3º nível.
+    nivelDoCurso: 3,
     baixarCsvAoFinal: true,                   // gera a planilha assim que a varredura termina
     separadorCsv: ';',                        // ';' é o que o Excel em português abre já em colunas
     repoIdUpload: null,                       // preencha só se o script não achar sozinho
@@ -550,7 +556,7 @@
       log('   (nenhum XML selecionado: as colunas "Arquivo AV1/AV2" da planilha vão sair em branco)', 'aviso');
     }
     const linhas = [];
-    const nomeDoCurso = nomeDaCategoria();
+    const nomeDoCurso = nomeDoCursoDaTrilha();
 
     for (const curso of cursos) {
       if (interromper) { log('Varredura interrompida.', 'aviso'); break; }
@@ -560,7 +566,6 @@
       const linha = {
         curto, nomeDoCurso,
         url: `${ORIGEM}/course/view.php?id=${curso.id}`,
-        banco: '',
         contagem: {}, total: 0, estado: 'erro', observacoes: [],
         arquivos: Object.fromEntries(Object.entries(arquivos).map(([k, v]) => [k, v.name])),
       };
@@ -574,7 +579,6 @@
           log(`   ${curto}: sem banco`, 'erro');
           continue;
         }
-        linha.banco = link.texto;
 
         const cfg = await paginaImportacao(link, curso.id, null);
         if (!cfg) {
@@ -641,9 +645,7 @@
 
   let ultimoDiagnostico = null;
 
-  // O "curso" do relatório é a categoria em que o script foi rodado. Vem do
-  // título da página; se o tema não trouxer, cai na última migalha do caminho
-  // e, por último, no <title> da aba.
+  // Nome da categoria aberta (a folha da trilha), pelo título da página.
   const RE_TITULO_GENERICO = /^(categorias?( de)? cursos?|cursos?|course categories)$/i;
 
   function nomeDaCategoria() {
@@ -651,13 +653,53 @@
       document.querySelector('.page-header-headings h1'),
       document.querySelector('#region-main h1'),
       document.querySelector('h1'),
-      [...document.querySelectorAll('#page-navbar .breadcrumb-item, nav .breadcrumb li')].pop(),
     ];
     for (const el of candidatos) {
       const nome = el ? txt(el) : '';
       if (nome && !RE_TITULO_GENERICO.test(nome)) return nome;
     }
     return (document.title || '').split(/\s*[|–]\s*/)[0].trim();
+  }
+
+  // Só os níveis de categoria da trilha, de fora para dentro. Um item entra
+  // quando é a categoria atual (sem link) ou quando aponta para uma categoria;
+  // assim "Cursos", "Página inicial" e "Painel" ficam de fora e a contagem de
+  // níveis não muda de um tema para outro.
+  //   Cursos / 2026.2 / Campus Volta Redonda / Engenharia Civil / Com Avaliação
+  //   ->  ['2026.2', 'Campus Volta Redonda', 'Engenharia Civil', 'Com Avaliação']
+  function trilhaDeCategorias() {
+    const itens = [...document.querySelectorAll(
+      '#page-navbar .breadcrumb-item, nav .breadcrumb li, ol.breadcrumb li')];
+    const niveis = [];
+    for (const item of itens) {
+      const nome = txt(item);
+      if (!nome || niveis.includes(nome)) continue;
+      const link = item.querySelector('a[href]');
+      if (link) {
+        const alvo = new URL(link.getAttribute('href'), ORIGEM);
+        const ehCategoria = /\/course\/index\.php/.test(alvo.pathname) && alvo.searchParams.get('categoryid');
+        if (!ehCategoria) continue;
+      }
+      niveis.push(nome);
+    }
+    return niveis;
+  }
+
+  // O curso fica num nível fixo da trilha (CONFIG.nivelDoCurso). Se a trilha
+  // for mais curta que isso, o mais específico que existe já é o curso.
+  function nomeDoCursoDaTrilha() {
+    const trilha = trilhaDeCategorias();
+    if (!trilha.length) return nomeDaCategoria();
+    return trilha[CONFIG.nivelDoCurso - 1] || trilha[trilha.length - 1];
+  }
+
+  // "Engenharia Civil - Com Avaliação": o curso e a pasta em que ele foi lido.
+  function descricaoDoLocal() {
+    const trilha = trilhaDeCategorias();
+    const curso = nomeDoCursoDaTrilha();
+    const atual = trilha.length ? trilha[trilha.length - 1] : nomeDaCategoria();
+    if (curso && atual && curso !== atual) return `${curso} - ${atual}`;
+    return curso || atual || '';
   }
 
   function contagemEmTexto(linha) {
@@ -702,13 +744,13 @@
   function csvDoDiagnostico(d) {
     const rotulos = CONFIG.categorias.map(rotuloDaCategoria);
     const cabecalho = [
-      'Matéria', 'Curso', 'URL', 'Banco',
+      'Matéria', 'Curso', 'URL',
       ...rotulos, 'Total', 'Situação',
       ...rotulos.map((r) => `Arquivo ${r}`),
       'Observações',
     ];
     const corpo = d.linhas.map((l) => [
-      l.curto, l.nomeDoCurso, l.url, l.banco,
+      l.curto, l.nomeDoCurso, l.url,
       ...rotulos.map((r) => (l.contagem[r] === null || l.contagem[r] === undefined ? '' : l.contagem[r])),
       l.total, l.estado,
       ...rotulos.map((r) => l.arquivos[r] || ''),
@@ -726,7 +768,7 @@
     const agora = new Date();
     const dd = (n) => String(n).padStart(2, '0');
     const carimbo = `${agora.getFullYear()}-${dd(agora.getMonth() + 1)}-${dd(agora.getDate())} ${dd(agora.getHours())}${dd(agora.getMinutes())}`;
-    const categoria = limpaNome(nomeDaCategoria()).slice(0, 60);
+    const categoria = limpaNome(descricaoDoLocal()).slice(0, 60);
     return `${limpaNome(`diagnostico bancos${categoria ? ` - ${categoria}` : ''} - ${carimbo}`)}.${extensao}`;
   }
 
@@ -811,7 +853,7 @@
 
       ultimoDiagnostico = {
         quando: new Date().toLocaleString('pt-BR'),
-        categoria: nomeDaCategoria(),
+        categoria: descricaoDoLocal(),
         detalhes,
         linhas,
       };
