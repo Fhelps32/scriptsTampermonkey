@@ -546,7 +546,11 @@
   async function varreduraBancos(cursos) {
     log('');
     log('Situação dos bancos nesta categoria:');
+    if (!arquivosPorChave.size) {
+      log('   (nenhum XML selecionado: as colunas "Arquivo AV1/AV2" da planilha vão sair em branco)', 'aviso');
+    }
     const linhas = [];
+    const nomeDoCurso = nomeDaCategoria();
 
     for (const curso of cursos) {
       if (interromper) { log('Varredura interrompida.', 'aviso'); break; }
@@ -554,9 +558,9 @@
       const arquivos = arquivosPorChave.get(chave(curso.nome)) || {};
 
       const linha = {
-        curso: curso.nome, curto, id: curso.id,
+        curto, nomeDoCurso,
         url: `${ORIGEM}/course/view.php?id=${curso.id}`,
-        banco: '', cmid: '',
+        banco: '',
         contagem: {}, total: 0, estado: 'erro', observacoes: [],
         arquivos: Object.fromEntries(Object.entries(arquivos).map(([k, v]) => [k, v.name])),
       };
@@ -571,7 +575,6 @@
           continue;
         }
         linha.banco = link.texto;
-        linha.cmid = link.cmid;
 
         const cfg = await paginaImportacao(link, curso.id, null);
         if (!cfg) {
@@ -638,9 +641,23 @@
 
   let ultimoDiagnostico = null;
 
+  // O "curso" do relatório é a categoria em que o script foi rodado. Vem do
+  // título da página; se o tema não trouxer, cai na última migalha do caminho
+  // e, por último, no <title> da aba.
+  const RE_TITULO_GENERICO = /^(categorias?( de)? cursos?|cursos?|course categories)$/i;
+
   function nomeDaCategoria() {
-    const h = document.querySelector('#region-main h1, .page-header-headings h1, h1');
-    return h ? txt(h) : '';
+    const candidatos = [
+      document.querySelector('.page-header-headings h1'),
+      document.querySelector('#region-main h1'),
+      document.querySelector('h1'),
+      [...document.querySelectorAll('#page-navbar .breadcrumb-item, nav .breadcrumb li')].pop(),
+    ];
+    for (const el of candidatos) {
+      const nome = el ? txt(el) : '';
+      if (nome && !RE_TITULO_GENERICO.test(nome)) return nome;
+    }
+    return (document.title || '').split(/\s*[|–]\s*/)[0].trim();
   }
 
   function contagemEmTexto(linha) {
@@ -685,13 +702,13 @@
   function csvDoDiagnostico(d) {
     const rotulos = CONFIG.categorias.map(rotuloDaCategoria);
     const cabecalho = [
-      'Matéria', 'Curso', 'ID', 'URL', 'Banco', 'cmid',
+      'Matéria', 'Curso', 'URL', 'Banco',
       ...rotulos, 'Total', 'Situação',
       ...rotulos.map((r) => `Arquivo ${r}`),
       'Observações',
     ];
     const corpo = d.linhas.map((l) => [
-      l.curto, l.curso, l.id, l.url, l.banco, l.cmid,
+      l.curto, l.nomeDoCurso, l.url, l.banco,
       ...rotulos.map((r) => (l.contagem[r] === null || l.contagem[r] === undefined ? '' : l.contagem[r])),
       l.total, l.estado,
       ...rotulos.map((r) => l.arquivos[r] || ''),
