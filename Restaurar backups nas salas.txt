@@ -1,0 +1,705 @@
+// ==UserScript==
+// @name         Restaurar backups nas salas existentes (UGB)
+// @namespace    https://nead.ugb.edu.br/
+// @version      1.0
+// @description  Manda os .mbz gerados pelo script de backup para dentro das salas já existentes da categoria aberta, mesclando o conteúdo sem mexer nas matrículas
+// @author       Você
+// @match        https://nead.ugb.edu.br/course/index.php*
+// @match        https://dependencia.ugb.edu.br/course/index.php*
+// @icon         https://nead.ugb.edu.br/favicon.ico
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------------
+  // Ajustes
+  // ----------------------------------------------------------------------
+  const CONFIG = {
+    // "Mesclar o backup com este curso": o conteúdo do backup é somado ao que
+    // já existe. Nada é apagado, e matrícula de aluno não é tocada.
+    // A outra opção do Moodle apaga o conteúdo do curso antes de restaurar —
+    // por isso ela não está aqui, nem como ajuste.
+    preservarConfiguracoes: true, // não deixar o backup sobrescrever nome e datas da sala
+    maxEtapas: 12,                // trava: a restauração tem 7 telas, 12 é folga
+    repoIdUpload: null,           // preencha só se o script não achar sozinho
+    pausaMs: 2000,                // a restauração roda no servidor: espaço entre as salas
+    usarIframe: true,
+    esperaIframeMs: 12000,
+  };
+
+  // "Mesclar o backup com este curso" no Moodle. É o valor que faz a
+  // restauração somar ao conteúdo existente em vez de criar sala nova.
+  const ALVO_MESCLAR = '1';
+
+  const ORIGEM = location.origin;
+  const abs = (u) => new URL(u, ORIGEM).href;
+  const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
+  const txt = (el) => (el && el.textContent || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+  const nomeCurto = (nome) => nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+
+  // Mesma chave do script de importar bancos: tira [26.2], (VR-ADM.N), acentos
+  // e símbolos, de modo que o nome da matéria case entre um semestre e outro.
+  const chave = (s) =>
+    s.replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\([^)]*\)/g, ' ')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  // ----------------------------------------------------------------------
+  // Rede
+  // ----------------------------------------------------------------------
+  async function baixaPagina(url) {
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      const html = await resp.text();
+      return { url: resp.url || url, status: resp.status, ok: resp.ok, html, doc: new DOMParser().parseFromString(html, 'text/html') };
+    } catch (e) {
+      return { url, status: 0, ok: false, html: '', doc: null, erro: e.message };
+    }
+  }
+
+  function carregaComJs(url, temOQuePreciso) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let doc = null;
+        try { doc = frame.contentDocument; } catch (e) { /* ignora */ }
+        if (doc && doc.readyState === 'complete' && temOQuePreciso(doc)) {
+          clearInterval(timer);
+          const copia = doc.cloneNode(true);
+          setTimeout(() => frame.remove(), 100);
+          resolve(copia);
+          return;
+        }
+        if (Date.now() > limite) {
+          clearInterval(timer);
+          const copia = doc ? doc.cloneNode(true) : null;
+          frame.remove();
+          resolve(copia);
+        }
+      }, 400);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Salas de destino (a categoria aberta)
+  // ----------------------------------------------------------------------
+  async function listarCursos() {
+    const paginas = new Map([[location.href, document]]);
+    document.querySelectorAll('.paging a[href], nav a[href*="page="]').forEach((a) => {
+      if (!paginas.has(a.href)) paginas.set(a.href, null);
+    });
+
+    const cursos = new Map();
+    for (const [url, cache] of paginas) {
+      let doc = cache;
+      if (!doc) { const r = await baixaPagina(url); if (!r.doc) continue; doc = r.doc; }
+      const escopo = doc.querySelector('#region-main') || doc.body;
+      escopo.querySelectorAll('a[href*="/course/view.php?id="]').forEach((a) => {
+        const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
+        const nome = txt(a);
+        if (id && nome && !cursos.has(id)) cursos.set(id, nome);
+      });
+    }
+    return [...cursos].map(([id, nome]) => ({ id, nome }));
+  }
+
+  // Quanto a sala de destino já tem. Serve de aviso: mesclar soma o backup ao
+  // que já está lá, então uma sala com conteúdo pode acabar com tudo em dobro.
+  function contaConteudo(doc) {
+    if (!doc) return { secoes: 0, itens: 0 };
+    const nos = new Set();
+    doc.querySelectorAll('li.section, li.course-section, [data-for="section"], .course-section').forEach((n) => nos.add(n));
+    const secoes = [...nos].filter((n) => ![...nos].some((o) => o !== n && o.contains(n)));
+
+    let itens = 0;
+    for (const secao of secoes) {
+      const candidatos = new Set();
+      secao.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+        .forEach((n) => candidatos.add(n));
+      const atividades = [...candidatos].filter((n) => ![...candidatos].some((o) => o !== n && o.contains(n)));
+      for (const item of atividades) {
+        const classe = item.className || '';
+        if (/modtype_label|\blabel\b/.test(classe)) continue;
+        itens++;
+      }
+    }
+    return { secoes: secoes.length, itens };
+  }
+
+  // O id de contexto da sala: é ele que a página de restauração pede. Vem do
+  // link "Reutilizar curso" e, se ele não estiver no HTML, da configuração que
+  // o Moodle injeta na própria página.
+  async function contextoDoCurso(courseid) {
+    const r = await baixaPagina(`${ORIGEM}/course/view.php?id=${courseid}`);
+    const link = r.doc ? r.doc.querySelector('a[href*="restorefile.php"], a[href*="backup/restorefile"]') : null;
+    if (link) {
+      const ctx = new URL(link.getAttribute('href'), ORIGEM).searchParams.get('contextid');
+      if (ctx) return ctx;
+    }
+    const m = (r.html || '').match(/"contextid"\s*:\s*(\d+)/) || (r.html || '').match(/"contextInstanceId"\s*:\s*(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // ----------------------------------------------------------------------
+  // Arquivos escolhidos
+  // ----------------------------------------------------------------------
+  let arquivosPorChave = new Map();
+
+  // O nome pode vir do jeito que o script de backup baixa (o nome da sala) ou
+  // com o padrão do Moodle: backup-moodle2-course-123-abreviatura-20260911-1730-nu.mbz
+  function chaveDoArquivo(nome) {
+    const base = nome
+      .replace(/\.mbz$/i, '')
+      .replace(/^backup-moodle2-course-\d+-/i, '')
+      .replace(/-\d{8}-\d{4}(-nu)?$/i, '');
+    return chave(base);
+  }
+
+  function registraArquivos(lista) {
+    arquivosPorChave = new Map();
+    let repetidos = 0;
+    for (const arq of lista) {
+      const k = chaveDoArquivo(arq.name);
+      if (!k) continue;
+      if (arquivosPorChave.has(k)) { repetidos++; continue; }
+      arquivosPorChave.set(k, arq);
+    }
+    log(`${lista.length} arquivo(s) escolhido(s): ${arquivosPorChave.size} matéria(s) reconhecida(s)` +
+        (repetidos ? `, ${repetidos} com nome repetido (ignorados)` : ''));
+  }
+
+  // ----------------------------------------------------------------------
+  // Envio do .mbz para a área de rascunho
+  // ----------------------------------------------------------------------
+  // O id do repositório "Enviar um arquivo" aparece no JSON que inicializa o
+  // seletor de arquivos. A ordem das chaves muda entre versões, então tento
+  // os dois formatos antes de ler o bloco inteiro.
+  function extraiRepoDoHtml(html) {
+    const variantes = [
+      /"id"\s*:\s*"?(\d+)"?[^{}]{0,600}?"type"\s*:\s*"upload"/,
+      /"type"\s*:\s*"upload"[^{}]{0,600}?"id"\s*:\s*"?(\d+)"?/,
+    ];
+    for (const re of variantes) { const m = html.match(re); if (m) return m[1]; }
+    return null;
+  }
+
+  function inspecionaComJs(url, extrai) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let achado = null;
+        try {
+          const w = frame.contentWindow, d = frame.contentDocument;
+          if (d && d.readyState === 'complete') achado = extrai(w, d);
+        } catch (e) { /* ignora */ }
+        if (achado != null || Date.now() > limite) {
+          clearInterval(timer);
+          frame.remove();
+          resolve(achado);
+        }
+      }, 500);
+    });
+  }
+
+  let repoUploadCache = null;
+
+  async function descobreRepoUpload(urlPagina, html) {
+    if (CONFIG.repoIdUpload) return CONFIG.repoIdUpload;
+    if (repoUploadCache) return repoUploadCache;
+
+    // Quase sempre o id já está no HTML que acabei de buscar: só caio no
+    // iframe (que custa segundos) quando não está.
+    const noHtml = extraiRepoDoHtml(html || '');
+    if (noHtml) { repoUploadCache = noHtml; return noHtml; }
+
+    const achado = await inspecionaComJs(urlPagina, (w, d) => {
+      const instancias = w.M && w.M.core_filepicker && w.M.core_filepicker.instances;
+      for (const k in (instancias || {})) {
+        const reps = instancias[k] && instancias[k].options && instancias[k].options.repositories;
+        for (const r in (reps || {})) {
+          if (reps[r] && reps[r].type === 'upload') return String(reps[r].id || r);
+        }
+      }
+      return extraiRepoDoHtml(d.documentElement.innerHTML);
+    });
+    if (achado) repoUploadCache = achado;
+    return achado;
+  }
+
+  // O campo do seletor de arquivos guarda o id da área de rascunho. O nome do
+  // campo muda entre versões, então procuro pelo formato do valor e dou
+  // preferência a quem tem "file"/"backup" no nome.
+  const RE_CAMPOS_DE_CONTROLE = /^(sesskey|_qf__|mform_isexpanded|contextid|courseid|id|MAX_FILE_SIZE|submitbutton|cancel)/i;
+
+  function campoDoArquivo(form) {
+    const candidatos = [...form.querySelectorAll('input[type="hidden"][name]')]
+      .filter((i) => !RE_CAMPOS_DE_CONTROLE.test(i.name) && /^\d{3,}$/.test(i.value || ''));
+    return candidatos.find((i) => /file|backup/i.test(i.name)) || candidatos[0] || null;
+  }
+
+  function formularioDeEnvio(doc) {
+    if (!doc) return null;
+    return [...doc.querySelectorAll('form')].find((f) => campoDoArquivo(f) && botaoDeAvancar(f)) || null;
+  }
+
+  async function enviaParaRascunho(arquivo, dados) {
+    const fd = new FormData();
+    fd.set('repo_upload_file', arquivo, arquivo.name);
+    fd.set('itemid', dados.itemid);
+    fd.set('repo_id', dados.repoId);
+    fd.set('ctx_id', dados.ctxId || '');
+    fd.set('env', 'filepicker');
+    fd.set('sesskey', dados.sesskey);
+    fd.set('title', arquivo.name);
+    fd.set('savepath', '/');
+    fd.set('author', '');
+    fd.set('overwrite', 1);
+
+    const resp = await fetch(`${ORIGEM}/repository/repository_ajax.php?action=upload`, {
+      method: 'POST', credentials: 'same-origin', body: fd,
+    });
+    const texto = await resp.text();
+    let json;
+    try { json = JSON.parse(texto); } catch (e) {
+      throw new Error(`o envio do arquivo devolveu resposta inesperada (HTTP ${resp.status})`);
+    }
+    if (json.error) throw new Error(`o Moodle recusou o arquivo: ${json.error}`);
+    return json;
+  }
+
+  // ----------------------------------------------------------------------
+  // Assistente de restauração
+  // ----------------------------------------------------------------------
+  const RE_BOTAO_DE_VOLTA = /cancel|previous|anterior|cancelar/i;
+  const RE_SUCESSO = /(restaurad[oa] com sucesso|restored successfully|o curso foi restaurado)/i;
+  const RE_ASSINCRONO = /(ass[ií]ncron|em segundo plano|in progress|será processad|sera processad|fila de execu)/i;
+
+  // Ajustes que trariam dados de aluno de volta. O backup vem sem usuários,
+  // mas mando zero de qualquer modo: matrícula da sala nova não se mexe.
+  const AJUSTES_DE_USUARIO = [
+    'setting_root_users',
+    'setting_root_role_assignments',
+    'setting_root_userscompletion',
+    'setting_root_logs',
+    'setting_root_grade_histories',
+    'setting_root_comments',
+  ];
+
+  function botaoDeAvancar(form) {
+    const botoes = [...form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])')];
+    return botoes.find((b) => !RE_BOTAO_DE_VOLTA.test(b.name || '') && !RE_BOTAO_DE_VOLTA.test(txt(b) || b.value || '')) || null;
+  }
+
+  function formularioDoAssistente(doc) {
+    if (!doc) return null;
+    return [...doc.querySelectorAll('form')].find((f) =>
+      f.querySelector('input[name="restore"], input[name="stage"]') && botaoDeAvancar(f)) || null;
+  }
+
+  // A tela de destino traz três formulários: novo curso, esta sala e buscar
+  // outra sala. Pego pelo valor do alvo, não pela ordem nem pelo texto: só o
+  // bloco "restaurar nesta sala" tem a opção de mesclar com valor 1.
+  function formularioDeDestino(doc) {
+    if (!doc) return null;
+    return [...doc.querySelectorAll('form')].find((f) =>
+      f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`)) || null;
+  }
+
+  function terminou(doc) {
+    if (!doc) return false;
+    const texto = txt(doc.querySelector('#region-main') || doc.body);
+    if (RE_SUCESSO.test(texto)) return true;
+    return !formularioDoAssistente(doc) && !formularioDeDestino(doc) && !formularioDeEnvio(doc);
+  }
+
+  function mensagemDeErro(doc) {
+    if (!doc) return 'resposta vazia do servidor';
+    return [...doc.querySelectorAll('.errorbox, .alert-danger, .invalid-feedback')]
+      .map((e) => txt(e)).filter(Boolean).slice(0, 2).join(' / ');
+  }
+
+  // Serializa o formulário como o navegador faria, preservando o estado de
+  // cada controle: reenviar só os campos escondidos desmarcaria as atividades
+  // e a restauração entraria vazia.
+  function dadosDoFormulario(form) {
+    try {
+      const dados = new FormData(form);
+      if ([...dados.keys()].length) return dados;
+    } catch (e) { /* documento do DOMParser: copio campo a campo */ }
+
+    const dados = new FormData();
+    form.querySelectorAll('input, select, textarea').forEach((campo) => {
+      const tipo = (campo.type || '').toLowerCase();
+      if (!campo.name || campo.disabled) return;
+      if (['submit', 'button', 'reset', 'file', 'image'].includes(tipo)) return;
+      if ((tipo === 'checkbox' || tipo === 'radio') && !campo.checked) return;
+      if (campo.tagName === 'SELECT') {
+        const escolhidas = [...campo.options].filter((o) => o.selected);
+        (escolhidas.length ? escolhidas : campo.options.length ? [campo.options[0]] : [])
+          .forEach((o) => dados.append(campo.name, o.value));
+        return;
+      }
+      dados.append(campo.name, campo.value);
+    });
+    return dados;
+  }
+
+  function ajustaDadosDaEtapa(dados, form, anota) {
+    let mexeu = [];
+
+    for (const nome of AJUSTES_DE_USUARIO) {
+      if (form.querySelector(`[name="${nome}"]`)) { dados.set(nome, '0'); mexeu.push(nome.replace('setting_root_', '')); }
+    }
+    // "Sobrescrever a configuração do curso" traria o nome, o formato e as
+    // datas da sala velha por cima da sala nova.
+    if (CONFIG.preservarConfiguracoes && form.querySelector('[name="setting_course_overwrite_conf"]')) {
+      dados.set('setting_course_overwrite_conf', '0');
+      mexeu.push('sem sobrescrever a configuração da sala');
+    }
+    if (anota && mexeu.length) anota(`   mantendo a sala como está: ${mexeu.join(', ')}`);
+  }
+
+  async function enviaFormulario(form, urlAtual, ajusta) {
+    const dados = dadosDoFormulario(form);
+    if (ajusta) ajusta(dados, form);
+
+    const botao = botaoDeAvancar(form);
+    if (botao && botao.name) dados.set(botao.name, botao.value || '1');
+
+    const acao = abs(form.getAttribute('action') || urlAtual);
+    const resp = await fetch(acao, { method: 'POST', credentials: 'same-origin', body: dados });
+    const html = await resp.text();
+    return { url: resp.url || acao, doc: new DOMParser().parseFromString(html, 'text/html') };
+  }
+
+  async function restaura(curso, arquivo, anota) {
+    const ctxId = await contextoDoCurso(curso.id);
+    if (!ctxId) throw new Error('não achei o id de contexto da sala');
+
+    const urlRestauracao = `${ORIGEM}/backup/restorefile.php?contextid=${ctxId}`;
+    let r = await baixaPagina(urlRestauracao);
+    let doc = r.doc;
+    let urlAtual = r.url;
+
+    // 1. Enviar o arquivo para a área de rascunho do formulário
+    let form = formularioDeEnvio(doc);
+    if (!form && CONFIG.usarIframe) {
+      const comJs = await carregaComJs(urlRestauracao, (d) => !!formularioDeEnvio(d));
+      if (comJs) { doc = comJs; form = formularioDeEnvio(comJs); }
+    }
+    if (!form) throw new Error(`não achei o formulário de envio do backup (HTTP ${r.status})`);
+
+    const campo = campoDoArquivo(form);
+    const sesskey = (form.querySelector('input[name="sesskey"]') || {}).value ||
+      ((r.html || '').match(/"sesskey"\s*:\s*"([^"]+)"/) || [])[1];
+    const repoId = await descobreRepoUpload(urlRestauracao, r.html);
+    if (!repoId) throw new Error('não achei o repositório de envio (preencha repoIdUpload no CONFIG)');
+
+    anota(`   enviando ${arquivo.name}…`);
+    await enviaParaRascunho(arquivo, { itemid: campo.value, repoId, ctxId, sesskey });
+
+    ({ url: urlAtual, doc } = await enviaFormulario(form, urlAtual));
+    let erro = mensagemDeErro(doc);
+    if (erro) throw new Error(`o Moodle recusou o arquivo enviado: ${erro}`);
+
+    // 2. Percorrer as telas da restauração
+    let escolheuDestino = false;
+    for (let etapa = 1; etapa <= CONFIG.maxEtapas; etapa++) {
+      if (terminou(doc)) {
+        return { assincrono: RE_ASSINCRONO.test(txt(doc.querySelector('#region-main') || doc.body)) };
+      }
+
+      const destino = formularioDeDestino(doc);
+      if (destino) {
+        anota('   destino: mesclar com esta sala (sem apagar nada, sem mexer nas matrículas)');
+        ({ url: urlAtual, doc } = await enviaFormulario(destino, urlAtual, (dados) => {
+          dados.set('target', ALVO_MESCLAR);
+        }));
+        escolheuDestino = true;
+      } else {
+        const atual = formularioDoAssistente(doc);
+        if (!atual) throw new Error(`a restauração parou na etapa ${etapa} sem como continuar`);
+        ({ url: urlAtual, doc } = await enviaFormulario(atual, urlAtual, (dados, f) => ajustaDadosDaEtapa(dados, f, anota)));
+      }
+
+      erro = mensagemDeErro(doc);
+      if (erro) throw new Error(`o Moodle recusou na etapa ${etapa}: ${erro}`);
+    }
+
+    if (!escolheuDestino) throw new Error('não cheguei na tela de destino — nada foi restaurado');
+    throw new Error('a restauração não chegou ao fim dentro do limite de etapas');
+  }
+
+  // ----------------------------------------------------------------------
+  // Confirmação por sala
+  // ----------------------------------------------------------------------
+  let perguntarSempre = true;
+
+  function confirmaSala(curso, arquivo, contagem, indice, total) {
+    return new Promise((resolve) => {
+      const fundo = document.createElement('div');
+      fundo.style.cssText = `position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);
+        display:flex;align-items:center;justify-content:center;font:13px/1.5 system-ui,sans-serif;`;
+
+      const caixa = document.createElement('div');
+      caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(520px,92vw);
+        box-shadow:0 12px 40px rgba(0,0,0,.3);`;
+
+      const avisoConteudo = contagem.itens
+        ? `<div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;padding:8px;color:#6b4e00;margin-bottom:12px;">
+             Esta sala <strong>já tem ${contagem.itens} item(ns)</strong>. Mesclar soma o backup ao que está lá —
+             se o conteúdo já tiver sido restaurado antes, ele vai aparecer em dobro.
+           </div>`
+        : '';
+
+      caixa.innerHTML = `
+        <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Sala ${indice} de ${total}</div>
+        <div style="font-size:15px;font-weight:600;margin:4px 0 10px;">${nomeCurto(curso.nome)}</div>
+        <div style="color:#333;">Vou restaurar nesta sala:</div>
+        <ul style="margin:6px 0 12px 18px;padding:0;color:#333;"><li><code>${arquivo.name}</code></li></ul>
+        ${avisoConteudo}
+        <div style="background:#eef3ff;border:1px solid #c9d8f5;border-radius:6px;padding:8px;color:#22407e;margin-bottom:12px;">
+          O conteúdo é <strong>somado</strong> à sala: nada é apagado e as matrículas dos alunos não mudam.
+          A restauração roda no servidor e demora; deixe a aba aberta.
+        </div>
+        <label style="display:flex;gap:6px;align-items:center;color:#555;margin-bottom:14px;">
+          <input type="checkbox" id="ugb-nao-perguntar"> Restaurar as próximas sem perguntar
+        </label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="ugb-parar" style="padding:8px 12px;border:0;border-radius:5px;background:#b3261e;color:#fff;cursor:pointer;">Parar tudo</button>
+          <button id="ugb-pular" style="padding:8px 12px;border:1px solid #ccd;border-radius:5px;background:#fff;color:#333;cursor:pointer;">Pular esta</button>
+          <button id="ugb-restaurar" style="padding:8px 12px;border:0;border-radius:5px;background:#28a745;color:#fff;cursor:pointer;">Restaurar</button>
+        </div>`;
+
+      fundo.appendChild(caixa);
+      document.body.appendChild(fundo);
+      caixa.querySelector('#ugb-restaurar').focus();
+
+      const responde = (res) => {
+        if (res === 'restaurar' && caixa.querySelector('#ugb-nao-perguntar').checked) perguntarSempre = false;
+        document.removeEventListener('keydown', tecla);
+        fundo.remove();
+        resolve(res);
+      };
+      const tecla = (e) => { if (e.key === 'Escape') responde('pular'); };
+
+      caixa.querySelector('#ugb-restaurar').onclick = () => responde('restaurar');
+      caixa.querySelector('#ugb-pular').onclick = () => responde('pular');
+      caixa.querySelector('#ugb-parar').onclick = () => responde('parar');
+      fundo.onclick = (e) => { if (e.target === fundo) responde('pular'); };
+      document.addEventListener('keydown', tecla);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Execução
+  // ----------------------------------------------------------------------
+  let rodando = false, interromper = false;
+  let relatorio = [];
+
+  async function executar(somenteConferir) {
+    if (rodando) return;
+    if (!arquivosPorChave.size) { log('Escolha os arquivos .mbz primeiro.', 'erro'); return; }
+    rodando = true; interromper = false; perguntarSempre = true; relatorio = [];
+    travaBotoes(true); botaoParar.style.display = ''; botaoCopiar.style.display = 'none';
+    painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} salas nesta categoria.`);
+      if (!somenteConferir) log('Vou confirmar sala por sala antes de restaurar.');
+
+      const usados = new Set();
+
+      for (let i = 0; i < cursos.length; i++) {
+        const curso = cursos[i];
+        if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+
+        const curto = nomeCurto(curso.nome);
+        const registro = { curso, curto, estado: 'pendente', observacao: '' };
+        relatorio.push(registro);
+        log(`— ${curto}`);
+
+        const k = chave(curso.nome);
+        const arquivo = arquivosPorChave.get(k);
+        if (!arquivo) {
+          registro.estado = 'sem arquivo';
+          registro.observacao = `nenhum .mbz com nome equivalente (chave ${k})`;
+          log('   pulada: nenhum arquivo com nome equivalente', 'aviso');
+          continue;
+        }
+        usados.add(k);
+
+        try {
+          const r = await baixaPagina(`${ORIGEM}/course/view.php?id=${curso.id}`);
+          const contagem = contaConteudo(r.doc);
+
+          if (somenteConferir) {
+            registro.estado = 'restauraria';
+            registro.observacao = `${arquivo.name}${contagem.itens ? ` — a sala já tem ${contagem.itens} item(ns)` : ''}`;
+            log(`   ok: ${arquivo.name} → esta sala${contagem.itens ? ` (já tem ${contagem.itens} item(ns))` : ''}`);
+            continue;
+          }
+
+          const resposta = perguntarSempre
+            ? await confirmaSala(curso, arquivo, contagem, i + 1, cursos.length)
+            : 'restaurar';
+          if (resposta === 'parar') { registro.estado = 'pulada'; log('Interrompido por você.', 'aviso'); break; }
+          if (resposta === 'pular') { registro.estado = 'pulada'; log('   pulada por você', 'aviso'); continue; }
+
+          const resultado = await restaura(curso, arquivo, (m) => log(m));
+          registro.estado = 'restaurada';
+          registro.observacao = arquivo.name;
+          log(`   restaurada: ${arquivo.name}`, 'ok');
+
+          if (resultado.assincrono) {
+            registro.observacao += ' (em segundo plano)';
+            log('   o site restaura em segundo plano: o conteúdo aparece na sala em alguns minutos', 'aviso');
+          }
+        } catch (e) {
+          registro.estado = 'erro';
+          registro.observacao = e.message;
+          log(`   erro: ${e.message}`, 'erro');
+        }
+        await dorme(CONFIG.pausaMs);
+      }
+
+      const sobraram = [...arquivosPorChave.keys()].filter((k) => !usados.has(k));
+      if (sobraram.length) {
+        log('');
+        log(`${sobraram.length} arquivo(s) sem sala correspondente nesta categoria:`, 'aviso');
+        sobraram.forEach((k) => log(`   ${arquivosPorChave.get(k).name}`, 'aviso'));
+      }
+
+      resumoFinal(sobraram);
+      if (relatorio.length) botaoCopiar.style.display = '';
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false; perguntarSempre = true;
+      travaBotoes(false); botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // Resumo
+  // ----------------------------------------------------------------------
+  const ESTADOS = [
+    ['restaurada', 'RESTAURADAS'],
+    ['restauraria', 'SALAS PRONTAS PARA RESTAURAR (só conferido)'],
+    ['sem arquivo', 'SEM ARQUIVO CORRESPONDENTE'],
+    ['pulada', 'PULADAS POR VOCÊ'],
+    ['erro', 'COM ERRO'],
+  ];
+
+  function textoResumo(sobraram) {
+    const linhas = [`RESTAURAÇÃO DOS BACKUPS — ${new Date().toLocaleString('pt-BR')}`];
+    linhas.push(`${relatorio.length} sala(s) percorrida(s).`);
+
+    for (const [estado, titulo] of ESTADOS) {
+      const itens = relatorio.filter((r) => r.estado === estado);
+      if (!itens.length) continue;
+      linhas.push('');
+      linhas.push(`${titulo} (${itens.length})`);
+      for (const r of itens) {
+        linhas.push(`  - ${r.curto}${r.observacao ? ` — ${r.observacao}` : ''}`);
+      }
+    }
+
+    if (sobraram && sobraram.length) {
+      linhas.push('');
+      linhas.push(`ARQUIVOS SEM SALA NESTA CATEGORIA (${sobraram.length})`);
+      sobraram.forEach((k) => linhas.push(`  - ${arquivosPorChave.get(k).name}`));
+    }
+    return linhas.join('\n');
+  }
+
+  function resumoFinal(sobraram) {
+    log('');
+    log('════════ RESUMO ════════');
+    for (const linha of textoResumo(sobraram).split('\n')) {
+      const tipo = /^RESTAURADAS/.test(linha) ? 'ok'
+        : (/^(SEM ARQUIVO|COM ERRO|PULADAS|ARQUIVOS SEM)/.test(linha) ? 'aviso' : undefined);
+      log(linha, tipo);
+    }
+  }
+
+  function copiarResumo() {
+    if (!relatorio.length) { log('Rode a restauração antes de copiar o resumo.', 'aviso'); return; }
+    navigator.clipboard.writeText(textoResumo())
+      .then(() => log('Resumo copiado para a área de transferência.', 'ok'))
+      .catch(() => log('Não consegui copiar automaticamente — selecione o texto no painel.', 'aviso'));
+  }
+
+  // ----------------------------------------------------------------------
+  // Painel
+  // ----------------------------------------------------------------------
+  const painel = document.createElement('div');
+  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;width:400px;
+    font:12px/1.45 system-ui,sans-serif;background:#fff;border:1px solid #ccd;border-radius:8px;
+    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
+
+  const titulo = document.createElement('div');
+  titulo.textContent = 'Restaurar backups nas salas';
+  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
+
+  const entrada = document.createElement('input');
+  entrada.type = 'file';
+  entrada.multiple = true;
+  entrada.accept = '.mbz';
+  entrada.style.cssText = 'display:block;margin-bottom:8px;width:100%;';
+  entrada.onchange = () => registraArquivos([...entrada.files]);
+
+  const botoes = document.createElement('div');
+  botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+
+  const criaBotao = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoes.appendChild(b);
+    return b;
+  };
+
+  const botao = criaBotao('Restaurar', '#28a745', () => executar(false));
+  const botaoConferir = criaBotao('Só conferir', '#5a6673', () => executar(true));
+  const botaoCopiar = criaBotao('Copiar resumo', '#5b21b6', copiarResumo);
+  botaoCopiar.style.display = 'none';
+  const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
+  botaoParar.style.display = 'none';
+
+  const travaBotoes = (t) => {
+    botao.disabled = botaoConferir.disabled = t;
+    botaoCopiar.disabled = t;
+  };
+
+  const painelLog = document.createElement('div');
+  painelLog.style.cssText = 'margin-top:8px;max-height:340px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+
+  painel.append(titulo, entrada, botoes, painelLog);
+  document.body.appendChild(painel);
+
+  function log(msg, tipo) {
+    const cor = { ok: '#177245', erro: '#b3261e', aviso: '#8a6100' }[tipo] || '#333';
+    const linha = document.createElement('div');
+    linha.style.color = cor;
+    linha.style.fontWeight = tipo ? '600' : 'normal';
+    linha.textContent = msg;
+    painelLog.appendChild(linha);
+    painelLog.scrollTop = painelLog.scrollHeight;
+    console.log('[UGB restaurar]', msg);
+  }
+})();

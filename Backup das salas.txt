@@ -41,6 +41,7 @@
   const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
   const txt = (el) => (el && el.textContent || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
   const nomeCurto = (nome) => nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+  const limpaNome = (s) => s.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
 
   // ----------------------------------------------------------------------
   // Rede
@@ -337,7 +338,7 @@
   // e montar um blob: o .mbz de uma sala pode ter centenas de MB, e assim o
   // navegador grava em disco enquanto baixa. O cookie da sessão vai junto
   // porque é o mesmo site.
-  async function baixaArquivo(arquivo) {
+  async function baixaArquivo(arquivo, nomeParaSalvar) {
     const url = new URL(arquivo.href);
     url.searchParams.set('forcedownload', '1');
 
@@ -359,7 +360,7 @@
 
     const a = document.createElement('a');
     a.href = url.href;
-    a.download = arquivo.nome;
+    a.download = nomeParaSalvar || arquivo.nome;
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
@@ -500,8 +501,13 @@
             // O backup já existe na sala: se só o download falhar, isso não
             // pode derrubar a sala inteira para a lista de erros.
             try {
-              const detalhe = await baixaArquivo(arquivo);
-              log(`   download iniciado${detalhe}`, 'ok');
+              // Salvo com o nome da sala, e não com o nome que o Moodle dá
+              // (backup-moodle2-course-123-abreviatura-…): é por esse nome que
+              // o script de restauração casa o arquivo com a sala do semestre
+              // novo.
+              const nomeParaSalvar = `${limpaNome(curso.nome)}.mbz`;
+              const detalhe = await baixaArquivo(arquivo, nomeParaSalvar);
+              log(`   download iniciado: ${nomeParaSalvar}${detalhe}`, 'ok');
               avisaSobreVariosDownloads();
               await dorme(CONFIG.pausaEntreDownloadsMs);
             } catch (e) {
