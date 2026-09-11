@@ -20,7 +20,8 @@
   const CONFIG = {
     // Backup
     semUsuarios: true,          // desmarca "incluir usuários inscritos" e o resto dos dados de aluno
-    baixarArquivo: false,       // além de gerar o .mbz no curso, baixar para o computador
+    baixarArquivo: true,        // baixar o .mbz para o computador, além de gerar na sala
+    pausaEntreDownloadsMs: 1500, // respiro entre downloads: em rajada o navegador bloqueia
     maxEtapas: 8,               // trava: o assistente do Moodle tem 4 etapas, 8 é folga
 
     // Conteúdo da sala — mesmas regras da auditoria de material de apoio.
@@ -315,35 +316,65 @@
   }
 
   async function achaArquivoGerado(docFinal, courseid, nomeArquivo) {
-    let link = procuraLink(docFinal, nomeArquivo);
+    const paraRestauracao = docFinal ? docFinal.querySelector('a[href*="restorefile.php"]') : null;
+    const paginaDeRestauracao = paraRestauracao
+      ? abs(paraRestauracao.getAttribute('href'))
+      : `${ORIGEM}/backup/restorefile.php?courseid=${courseid}`;
 
+    let link = procuraLink(docFinal, nomeArquivo);
     if (!link) {
-      const paraRestauracao = docFinal ? docFinal.querySelector('a[href*="restorefile.php"]') : null;
-      const url = paraRestauracao
-        ? abs(paraRestauracao.getAttribute('href'))
-        : `${ORIGEM}/backup/restorefile.php?courseid=${courseid}`;
-      const r = await baixaPagina(url);
+      const r = await baixaPagina(paginaDeRestauracao);
       link = procuraLink(r.doc, nomeArquivo);
     }
-    if (!link) return nomeArquivo ? { href: '', nome: nomeArquivo } : null;
+    if (!link) return { href: '', nome: nomeArquivo || '', paginaDeRestauracao };
 
     const href = abs(link.getAttribute('href'));
     const nome = txt(link) || decodeURIComponent(href.split('/').pop().split('?')[0]);
-    return { href, nome };
+    return { href, nome, paginaDeRestauracao };
   }
 
+  // Baixa pelo próprio link, em vez de puxar o arquivo inteiro para a memória
+  // e montar um blob: o .mbz de uma sala pode ter centenas de MB, e assim o
+  // navegador grava em disco enquanto baixa. O cookie da sessão vai junto
+  // porque é o mesmo site.
   async function baixaArquivo(arquivo) {
-    const resp = await fetch(arquivo.href, { credentials: 'same-origin' });
-    if (!resp.ok) throw new Error(`download falhou (HTTP ${resp.status})`);
-    const blob = await resp.blob();
+    const url = new URL(arquivo.href);
+    url.searchParams.set('forcedownload', '1');
+
+    // Confiro antes de anunciar: se vier a tela de login, um 403 ou uma página
+    // de erro, é melhor dizer isso do que garantir um download que não houve.
+    let detalhe = '';
+    try {
+      const resp = await fetch(url.href, { method: 'HEAD', credentials: 'same-origin' });
+      if (resp.status === 403 || resp.status === 404) throw new Error(`o servidor respondeu HTTP ${resp.status}`);
+      if (/text\/html/i.test(resp.headers.get('content-type') || '')) {
+        throw new Error('o link devolveu uma página, não o arquivo');
+      }
+      const tamanho = Number(resp.headers.get('content-length') || 0);
+      if (tamanho) detalhe = ` (${(tamanho / 1048576).toFixed(1)} MB)`;
+    } catch (e) {
+      // Servidor que recusa HEAD não é motivo para desistir do download.
+      if (/HTTP |página/.test(e.message)) throw e;
+    }
 
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    a.href = url.href;
     a.download = arquivo.nome;
+    a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    return detalhe;
+  }
+
+  // O navegador trata download em rajada como abuso: o primeiro passa e os
+  // demais são bloqueados sem aviso nenhum na página.
+  let avisouSobreDownloads = false;
+  function avisaSobreVariosDownloads() {
+    if (avisouSobreDownloads) return;
+    avisouSobreDownloads = true;
+    log('   (se o navegador perguntar se este site pode baixar vários arquivos, responda que sim —', 'aviso');
+    log('    sem isso ele bloqueia do segundo em diante em silêncio)', 'aviso');
   }
 
   // ----------------------------------------------------------------------
@@ -457,19 +488,30 @@
           const arquivo = await achaArquivoGerado(resultado.doc, curso.id, resultado.nomeArquivo);
 
           registro.estado = 'backup feito';
-          registro.observacao = arquivo ? arquivo.nome : 'arquivo na área de backup do curso';
-          log(`   backup feito${arquivo ? `: ${arquivo.nome}` : ''}`, 'ok');
+          registro.observacao = arquivo.nome || 'arquivo na área de backup do curso';
+          log(`   backup gerado na área de backup da sala${arquivo.nome ? `: ${arquivo.nome}` : ''}`, 'ok');
 
           if (resultado.assincrono) {
             registro.observacao += ' (em segundo plano)';
             log('   o site faz backup assíncrono: o arquivo aparece na área de backup em alguns minutos', 'aviso');
           }
 
-          if (CONFIG.baixarArquivo && arquivo && arquivo.href) {
-            await baixaArquivo(arquivo);
-            log('   arquivo baixado para o computador', 'ok');
+          if (CONFIG.baixarArquivo && arquivo.href) {
+            // O backup já existe na sala: se só o download falhar, isso não
+            // pode derrubar a sala inteira para a lista de erros.
+            try {
+              const detalhe = await baixaArquivo(arquivo);
+              log(`   download iniciado${detalhe}`, 'ok');
+              avisaSobreVariosDownloads();
+              await dorme(CONFIG.pausaEntreDownloadsMs);
+            } catch (e) {
+              registro.observacao += ` — download falhou: ${e.message}`;
+              log(`   download falhou: ${e.message}`, 'erro');
+              log(`   o backup continua na sala; baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
+            }
           } else if (CONFIG.baixarArquivo) {
-            log('   não achei o link do arquivo para baixar — ele está na área de backup do curso', 'aviso');
+            registro.observacao += ' — sem link para download';
+            log(`   não achei o link do arquivo. Baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
           }
         } catch (e) {
           registro.estado = 'erro';
