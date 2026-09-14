@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Importar bancos de questões AV1/AV2 (Dependência UGB)
+// @name         Importar bancos de questões AV1 e AV2 (Dependência)
 // @namespace    https://dependencia.ugb.edu.br/
 // @version      1.1
-// @description  Importa os XMLs exportados de um período para os bancos das salas do período novo, e diagnostica a situação dos bancos com resumo copiável e planilha CSV
+// @description  Onde usar: abra na Dependência a categoria com a lista das salas do semestre NOVO e use o painel no canto da tela. Manda para os bancos dessas salas os arquivos XML baixados do semestre anterior. O botão Diagnosticar mostra a situação de cada banco, em resumo e em planilha.
 // @author       Você
 // @match        https://dependencia.ugb.edu.br/course/index.php*
 // @icon         https://dependencia.ugb.edu.br/favicon.ico

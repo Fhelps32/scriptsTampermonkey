@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Backup das salas sem alunos (UGB)
+// @name         Fazer backup das salas sem alunos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
 // @version      1.0
-// @description  Percorre as salas da categoria aberta, confere se têm conteúdo e gera o backup de cada uma sem os usuários inscritos
+// @description  Onde usar: abra a categoria com a lista das salas do semestre que vai ser copiado e use o painel no canto da tela. Gera o backup de cada sala SEM os alunos inscritos e baixa o arquivo .mbz. Sala sem conteúdo é pulada.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @match        https://dependencia.ugb.edu.br/course/index.php*
@@ -24,7 +24,7 @@
     pausaEntreDownloadsMs: 1500, // respiro entre downloads: em rajada o navegador bloqueia
     maxEtapas: 8,               // trava: o assistente do Moodle tem 4 etapas, 8 é folga
 
-    // Conteúdo da sala — mesmas regras da auditoria de material de apoio.
+    // Conteúdo da sala — mesmas regras do script "Conferir material de apoio".
     // Diferença: aqui item oculto CONTA como conteúdo, porque ele vai junto no
     // backup e a sala não está vazia de verdade.
     pularSalasSemConteudo: true,
@@ -592,7 +592,7 @@
     box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
 
   const titulo = document.createElement('div');
-  titulo.textContent = 'Backup das salas (sem alunos)';
+  titulo.textContent = 'Fazer backup das salas (sem alunos)';
   titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
 
   const botoes = document.createElement('div');

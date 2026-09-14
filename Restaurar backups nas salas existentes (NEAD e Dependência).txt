@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Restaurar backups nas salas existentes (UGB)
+// @name         Restaurar backups nas salas existentes (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
 // @version      1.0
-// @description  Manda os .mbz gerados pelo script de backup para dentro das salas já existentes da categoria aberta, mesclando o conteúdo sem mexer nas matrículas
+// @description  Onde usar: abra a categoria com a lista das salas do semestre NOVO e use o painel no canto da tela. Manda os arquivos .mbz do semestre anterior para dentro das salas que já existem: o conteúdo é somado e as matrículas dos alunos não mudam.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @match        https://dependencia.ugb.edu.br/course/index.php*
@@ -23,6 +23,13 @@
     // A outra opção do Moodle apaga o conteúdo do curso antes de restaurar —
     // por isso ela não está aqui, nem como ajuste.
     preservarConfiguracoes: true, // não deixar o backup sobrescrever nome e datas da sala
+
+    // Conteúdo da sala de destino — as mesmas regras do script "Conferir
+    // material de apoio", para "sala com conteúdo" querer dizer a mesma coisa
+    // em todos: fórum não conta, rótulo não conta e item oculto não conta.
+    rotulosContamComoConteudo: false,
+    tiposIgnorados: ['forum'],
+
     maxEtapas: 12,                // trava: a restauração tem 7 telas, 12 é folga
     repoIdUpload: null,           // preencha só se o script não achar sozinho
     pausaMs: 2000,                // a restauração roda no servidor: espaço entre as salas
@@ -39,8 +46,9 @@
   const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
   const txt = (el) => (el && el.textContent || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
   const nomeCurto = (nome) => nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+  const norm = (s) => s.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/\s+/g, ' ').trim();
 
-  // Mesma chave do script de importar bancos: tira [26.2], (VR-ADM.N), acentos
+  // Mesma chave do "Importar bancos de questões": tira [26.2], (VR-ADM.N), acentos
   // e símbolos, de modo que o nome da matéria case entre um semestre e outro.
   const chave = (s) =>
     s.replace(/\[[^\]]*\]/g, ' ')
@@ -113,25 +121,37 @@
 
   // Quanto a sala de destino já tem. Serve de aviso: mesclar soma o backup ao
   // que já está lá, então uma sala com conteúdo pode acabar com tudo em dobro.
+  //
+  // A contagem é a mesma do "Conferir material de apoio": fórum não é
+  // material de estudo, rótulo é texto solto e item oculto não está valendo
+  // para o aluno — nenhum dos três conta como conteúdo.
   function contaConteudo(doc) {
     if (!doc) return { secoes: 0, itens: 0 };
     const nos = new Set();
     doc.querySelectorAll('li.section, li.course-section, [data-for="section"], .course-section').forEach((n) => nos.add(n));
     const secoes = [...nos].filter((n) => ![...nos].some((o) => o !== n && o.contains(n)));
 
-    let itens = 0;
+    let itens = 0, ocultos = 0, ignorados = 0;
     for (const secao of secoes) {
       const candidatos = new Set();
       secao.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
         .forEach((n) => candidatos.add(n));
       const atividades = [...candidatos].filter((n) => ![...candidatos].some((o) => o !== n && o.contains(n)));
+
       for (const item of atividades) {
         const classe = item.className || '';
-        if (/modtype_label|\blabel\b/.test(classe)) continue;
+        const mtipo = (classe.match(/modtype_(\w+)/) || [])[1] || '';
+        const ehRotulo = /modtype_label|\blabel\b/.test(classe);
+        const escondido = /\bhidden\b|dimmed/.test(classe) ||
+          /OCULTO|N[ÃA]O DISPON[ÍI]VEL|HIDDEN FROM STUDENTS/.test(norm(txt(item.querySelector('.badge, .availabilityinfo')) || ''));
+
+        if (CONFIG.tiposIgnorados.includes(mtipo.toLowerCase())) { ignorados++; continue; }
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo) continue;
+        if (escondido) { ocultos++; continue; }
         itens++;
       }
     }
-    return { secoes: secoes.length, itens };
+    return { secoes: secoes.length, itens, ocultos, ignorados };
   }
 
   // O id de contexto da sala: é ele que a página de restauração pede. Vem do
@@ -153,7 +173,7 @@
   // ----------------------------------------------------------------------
   let arquivosPorChave = new Map();
 
-  // O nome pode vir do jeito que o script de backup baixa (o nome da sala) ou
+  // O nome pode vir do jeito que o "Fazer backup das salas" baixa (o nome da sala) ou
   // com o padrão do Moodle: backup-moodle2-course-123-abreviatura-20260911-1730-nu.mbz
   function chaveDoArquivo(nome) {
     const base = nome

@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Baixar bancos de questões AV1/AV2 (Dependência UGB)
+// @name         Baixar bancos de questões AV1 e AV2 (Dependência)
 // @namespace    https://dependencia.ugb.edu.br/
 // @version      3.0
-// @description  Percorre os cursos da categoria aberta, localiza o banco de questões e exporta as categorias AV1 e AV2
+// @description  Onde usar: abra na Dependência a categoria com a lista das salas e use o painel no canto da tela. Baixa um arquivo XML por prova (AV1 e AV2) do banco de questões de cada sala.
 // @author       Você
 // @match        https://dependencia.ugb.edu.br/course/index.php*
 // @icon         https://dependencia.ugb.edu.br/favicon.ico

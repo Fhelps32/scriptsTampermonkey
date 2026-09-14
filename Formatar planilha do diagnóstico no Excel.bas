@@ -1,9 +1,11 @@
 Attribute VB_Name = "FormatarDiagnosticoUGB"
 '==============================================================================
-' Formatar diagnóstico dos bancos (UGB)
+' Formatar planilha do diagnóstico no Excel
 '
-' Deixa apresentável o CSV gerado pelo botão "Baixar CSV" do script
-' "Importar bancos de questões": título, cabeçalho fixo, filtro, cores por
+' Onde usar: no Excel, com o CSV do diagnóstico aberto na frente. Esse arquivo
+' vem do botão "Baixar CSV" do script "Importar bancos de questões AV1 e AV2".
+'
+' Deixa a planilha apresentável: título, cabeçalho fixo, filtro, cores por
 ' situação, linha de totais e área de impressão.
 '
 ' COMO INSTALAR (uma vez só)
