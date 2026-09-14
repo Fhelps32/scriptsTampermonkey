@@ -269,9 +269,20 @@
     return candidatos.find((i) => /file|backup/i.test(i.name)) || candidatos[0] || null;
   }
 
+  // O seletor de arquivos do Moodle deixa marcas no HTML. Procurar por elas é
+  // mais seguro do que aceitar "qualquer formulário com um campo escondido
+  // numérico", que casa com formulário de busca e manda o arquivo para o lugar
+  // errado — e aí a tela volta para o começo sem dizer por quê.
+  const SELETOR_DE_ARQUIVO =
+    '[data-fieldtype="filemanager"], [data-fieldtype="filepicker"], .filemanager, .filepicker, ' +
+    '.ffilemanager, .ffilepicker, input[name="MAX_FILE_SIZE"]';
+
   function formularioDeEnvio(doc) {
     if (!doc) return null;
-    return [...doc.querySelectorAll('form')].find((f) => campoDoArquivo(f) && botaoDeAvancar(f)) || null;
+    const formularios = [...doc.querySelectorAll('form')];
+    return formularios.find((f) => f.querySelector(SELETOR_DE_ARQUIVO) && campoDoArquivo(f) && botaoDeAvancar(f))
+        || formularios.find((f) => campoDoArquivo(f) && botaoDeAvancar(f))
+        || null;
   }
 
   async function enviaParaRascunho(arquivo, dados) {
@@ -322,10 +333,32 @@
     return botoes.find((b) => !RE_BOTAO_DE_VOLTA.test(b.name || '') && !RE_BOTAO_DE_VOLTA.test(txt(b) || b.value || '')) || null;
   }
 
+  // "restorefile.php" não contém "restore.php", então o endereço separa as
+  // telas do assistente da tela de envio sem ambiguidade.
   function formularioDoAssistente(doc) {
     if (!doc) return null;
-    return [...doc.querySelectorAll('form')].find((f) =>
-      f.querySelector('input[name="restore"], input[name="stage"]') && botaoDeAvancar(f)) || null;
+    return [...doc.querySelectorAll('form')].find((f) => {
+      if (!botaoDeAvancar(f)) return false;
+      if (f.querySelector('input[name="restore"], input[name="stage"]')) return true;
+      // Em parte das versões a etapa vai na URL do formulário, não num campo.
+      return /backup\/restore\.php/.test(f.getAttribute('action') || '');
+    }) || null;
+  }
+
+  // Quando uma tela não é reconhecida, é isto que transforma "parou na etapa 1"
+  // em algo que dá para agir: o título, o aviso do Moodle e os formulários.
+  function descreveTela(doc) {
+    if (!doc) return 'a resposta veio vazia';
+    const titulo = txt(doc.querySelector('#region-main h1, #region-main h2, h1')) || '(sem título)';
+    const erro = mensagemDeErro(doc);
+    const formularios = [...doc.querySelectorAll('form')].map((f) => {
+      const acao = (f.getAttribute('action') || '(mesma página)').replace(ORIGEM, '');
+      const campos = [...new Set([...f.querySelectorAll('input[name], select[name]')].map((i) => i.name))];
+      const botao = botaoDeAvancar(f);
+      return `${acao} campos[${campos.slice(0, 10).join(', ')}] ${botao ? `botão "${txt(botao) || botao.value}"` : 'sem botão'}`;
+    });
+    return `tela "${titulo}"${erro ? ` · aviso do Moodle: ${erro}` : ''} · ` +
+      (formularios.length ? `formulários: ${formularios.join('  ||  ')}` : 'nenhum formulário');
   }
 
   // A tela de destino traz três formulários: novo curso, esta sala e buscar
@@ -346,8 +379,9 @@
 
   function mensagemDeErro(doc) {
     if (!doc) return 'resposta vazia do servidor';
-    return [...doc.querySelectorAll('.errorbox, .alert-danger, .invalid-feedback')]
-      .map((e) => txt(e)).filter(Boolean).slice(0, 2).join(' / ');
+    return [...doc.querySelectorAll(
+      '.errorbox, .alert-danger, .alert-warning, .invalid-feedback, .form-control-feedback, [id^="id_error_"]')]
+      .map((e) => txt(e)).filter(Boolean).slice(0, 3).join(' / ');
   }
 
   // Serializa o formulário como o navegador faria, preservando o estado de
@@ -404,7 +438,7 @@
     return { url: resp.url || acao, doc: new DOMParser().parseFromString(html, 'text/html') };
   }
 
-  async function restaura(curso, arquivo, anota) {
+  async function restaura(curso, arquivo, anota, pararNoDestino) {
     const ctxId = await contextoDoCurso(curso.id);
     if (!ctxId) throw new Error('não achei o id de contexto da sala');
 
@@ -422,13 +456,20 @@
     if (!form) throw new Error(`não achei o formulário de envio do backup (HTTP ${r.status})`);
 
     const campo = campoDoArquivo(form);
+    if (!campo) throw new Error(`achei o formulário de envio mas não o campo do arquivo — ${descreveTela(doc)}`);
     const sesskey = (form.querySelector('input[name="sesskey"]') || {}).value ||
       ((r.html || '').match(/"sesskey"\s*:\s*"([^"]+)"/) || [])[1];
     const repoId = await descobreRepoUpload(urlRestauracao, r.html);
     if (!repoId) throw new Error('não achei o repositório de envio (preencha repoIdUpload no CONFIG)');
 
+    if (pararNoDestino) {
+      anota(`   envio: campo "${campo.name}" (rascunho ${campo.value}), repositório ${repoId}, sesskey ${sesskey ? 'ok' : 'NÃO ACHEI'}`);
+      anota(`   ${descreveTela(doc)}`);
+    }
+
     anota(`   enviando ${arquivo.name}…`);
-    await enviaParaRascunho(arquivo, { itemid: campo.value, repoId, ctxId, sesskey });
+    const envio = await enviaParaRascunho(arquivo, { itemid: campo.value, repoId, ctxId, sesskey });
+    if (pararNoDestino) anota(`   o Moodle aceitou o arquivo: ${JSON.stringify(envio).slice(0, 200)}`);
 
     ({ url: urlAtual, doc } = await enviaFormulario(form, urlAtual));
     let erro = mensagemDeErro(doc);
@@ -443,6 +484,11 @@
 
       const destino = formularioDeDestino(doc);
       if (destino) {
+        if (pararNoDestino) {
+          anota(`   cheguei na tela de destino — ${descreveTela(doc)}`);
+          anota('   diagnóstico: paro aqui. NADA foi restaurado nesta sala.', 'ok');
+          return { diagnostico: true };
+        }
         anota('   destino: mesclar com esta sala (sem apagar nada, sem mexer nas matrículas)');
         ({ url: urlAtual, doc } = await enviaFormulario(destino, urlAtual, (dados) => {
           dados.set('target', ALVO_MESCLAR);
@@ -450,7 +496,14 @@
         escolheuDestino = true;
       } else {
         const atual = formularioDoAssistente(doc);
-        if (!atual) throw new Error(`a restauração parou na etapa ${etapa} sem como continuar`);
+        if (!atual) {
+          // Continuar na tela de envio quer dizer que o arquivo não foi aceito;
+          // qualquer outra coisa é uma tela que eu não soube ler.
+          throw new Error(formularioDeEnvio(doc)
+            ? `o Moodle voltou para a tela de envio do arquivo — ${descreveTela(doc)}`
+            : `não reconheci a tela da etapa ${etapa} — ${descreveTela(doc)}`);
+        }
+        if (pararNoDestino) anota(`   etapa ${etapa} — ${descreveTela(doc)}`);
         ({ url: urlAtual, doc } = await enviaFormulario(atual, urlAtual, (dados, f) => ajustaDadosDaEtapa(dados, f, anota)));
       }
 
@@ -528,6 +581,35 @@
   // ----------------------------------------------------------------------
   let rodando = false, interromper = false;
   let relatorio = [];
+
+  // Vai até a tela de destino e para. Serve para descobrir onde o caminho
+  // quebra sem restaurar nada: até essa tela, a sala não é tocada.
+  async function diagnosticar() {
+    if (rodando) return;
+    if (!arquivosPorChave.size) { log('Escolha os arquivos .mbz primeiro.', 'erro'); return; }
+    rodando = true; travaBotoes(true); painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      const curso = cursos.find((c) => arquivosPorChave.has(chave(c.nome)));
+      if (!curso) { log('Nenhuma sala desta categoria casou com os arquivos escolhidos.', 'erro'); return; }
+
+      const arquivo = arquivosPorChave.get(chave(curso.nome));
+      log(`Testando: ${nomeCurto(curso.nome)} (id ${curso.id})`);
+      log(`Arquivo: ${arquivo.name}`);
+
+      const ctx = await contextoDoCurso(curso.id);
+      log(`Contexto da sala: ${ctx || 'NÃO ACHEI'}`, ctx ? 'ok' : 'erro');
+      if (!ctx) return;
+
+      await restaura(curso, arquivo, (m, t) => log(m, t), true);
+    } catch (e) {
+      log(`Parou aqui: ${e.message}`, 'erro');
+      log('Copie o resumo e me mande: é essa descrição da tela que diz o que ajustar.', 'aviso');
+    } finally {
+      rodando = false; travaBotoes(false);
+    }
+  }
 
   async function executar(somenteConferir) {
     if (rodando) return;
@@ -696,13 +778,14 @@
 
   const botao = criaBotao('Restaurar', '#28a745', () => executar(false));
   const botaoConferir = criaBotao('Só conferir', '#5a6673', () => executar(true));
+  const botaoDiag = criaBotao('Diagnosticar', '#2d5bd0', diagnosticar);
   const botaoCopiar = criaBotao('Copiar resumo', '#5b21b6', copiarResumo);
   botaoCopiar.style.display = 'none';
   const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
   botaoParar.style.display = 'none';
 
   const travaBotoes = (t) => {
-    botao.disabled = botaoConferir.disabled = t;
+    botao.disabled = botaoConferir.disabled = botaoDiag.disabled = t;
     botaoCopiar.disabled = t;
   };
 
