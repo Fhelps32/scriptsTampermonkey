@@ -277,11 +277,17 @@
     '[data-fieldtype="filemanager"], [data-fieldtype="filepicker"], .filemanager, .filepicker, ' +
     '.ffilemanager, .ffilepicker, input[name="MAX_FILE_SIZE"]';
 
+  // A página de restauração traz outros formulários da barra do curso, e um
+  // deles — o de modo de edição — tem um campo "context" com número grande,
+  // igualzinho a um id de rascunho. Por isso o formulário de envio só é aceito
+  // quando tem o seletor de arquivos do Moodle ou quando o endereço dele é o
+  // da própria página de restauração.
   function formularioDeEnvio(doc) {
     if (!doc) return null;
-    const formularios = [...doc.querySelectorAll('form')];
-    return formularios.find((f) => f.querySelector(SELETOR_DE_ARQUIVO) && campoDoArquivo(f) && botaoDeAvancar(f))
-        || formularios.find((f) => campoDoArquivo(f) && botaoDeAvancar(f))
+    const formularios = [...doc.querySelectorAll('form')]
+      .filter((f) => campoDoArquivo(f) && botaoDeAvancar(f));
+    return formularios.find((f) => f.querySelector(SELETOR_DE_ARQUIVO))
+        || formularios.find((f) => /restorefile\.php/.test(f.getAttribute('action') || ''))
         || null;
   }
 
@@ -364,10 +370,26 @@
   // A tela de destino traz três formulários: novo curso, esta sala e buscar
   // outra sala. Pego pelo valor do alvo, não pela ordem nem pelo texto: só o
   // bloco "restaurar nesta sala" tem a opção de mesclar com valor 1.
+  // Os três blocos da tela de destino carregam "target" e "targetid", mas dois
+  // deles são caixas de busca ("Categorias de pesquisa", "Buscar cursos") que
+  // não levam a lugar nenhum. O bloco que vale é o que tem a opção de mesclar
+  // como escolha de verdade e um botão de seguir adiante.
+  const RE_BOTAO_DE_BUSCA = /search|busca|pesquis/i;
+
+  function ehFormularioDeBusca(form) {
+    const botao = botaoDeAvancar(form);
+    if (!botao) return true;
+    if (RE_BOTAO_DE_BUSCA.test(botao.name || '') || RE_BOTAO_DE_BUSCA.test(txt(botao) || botao.value || '')) return true;
+    return !!form.querySelector('input[name="catsearch"], input[name="search"]');
+  }
+
   function formularioDeDestino(doc) {
     if (!doc) return null;
-    return [...doc.querySelectorAll('form')].find((f) =>
-      f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`)) || null;
+    const candidatos = [...doc.querySelectorAll('form')].filter((f) =>
+      f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`) && !ehFormularioDeBusca(f));
+    const comEscolha = candidatos.find((f) =>
+      (f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`).type || '').toLowerCase() === 'radio');
+    return comEscolha || candidatos[0] || null;
   }
 
   function terminou(doc) {
