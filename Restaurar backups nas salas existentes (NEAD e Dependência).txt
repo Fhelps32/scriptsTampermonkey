@@ -2,7 +2,7 @@
 // @name         Restaurar backups nas salas existentes (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
 // @version      1.0
-// @description  Onde usar: abra a categoria com a lista das salas do semestre NOVO e use o painel no canto da tela. Manda os arquivos .mbz do semestre anterior para dentro das salas que já existem: o conteúdo é somado e as matrículas dos alunos não mudam.
+// @description  Onde usar: abra a categoria com a lista das salas do semestre NOVO e use o painel no canto da tela. Para cada sala: apaga o conteúdo que está lá e põe no lugar o conteúdo do backup do semestre anterior. Os alunos matriculados NÃO são mexidos.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @match        https://dependencia.ugb.edu.br/course/index.php*
@@ -18,10 +18,16 @@
   // Ajustes
   // ----------------------------------------------------------------------
   const CONFIG = {
-    // "Mesclar o backup com este curso": o conteúdo do backup é somado ao que
-    // já existe. Nada é apagado, e matrícula de aluno não é tocada.
-    // A outra opção do Moodle apaga o conteúdo do curso antes de restaurar —
-    // por isso ela não está aqui, nem como ajuste.
+    // O que fazer com o que já está na sala de destino:
+    //   'apagar'  — apaga o conteúdo da sala e põe o do backup no lugar
+    //   'mesclar' — soma o conteúdo do backup ao que já existe
+    modoDeRestauracao: 'apagar',
+
+    // Trava de segurança, explicada no bloco sobre matrículas mais abaixo:
+    // sem o ajuste que preserva matrículas, a restauração nem chega a rodar.
+    exigirManterMatriculas: true,
+    conferirMatriculasDepois: true,
+
     preservarConfiguracoes: true, // não deixar o backup sobrescrever nome e datas da sala
 
     // Conteúdo da sala de destino — as mesmas regras do script "Conferir
@@ -37,9 +43,32 @@
     esperaIframeMs: 12000,
   };
 
-  // "Mesclar o backup com este curso" no Moodle. É o valor que faz a
-  // restauração somar ao conteúdo existente em vez de criar sala nova.
-  const ALVO_MESCLAR = '1';
+  // Os dois destinos "nesta sala" do Moodle. Nenhum dos dois cria sala nova.
+  const ALVO_APAGAR = '0';   // apaga o conteúdo da sala e restaura por cima
+  const ALVO_MESCLAR = '1';  // soma ao que já existe
+
+  const alvoEscolhido = () => (CONFIG.modoDeRestauracao === 'mesclar' ? ALVO_MESCLAR : ALVO_APAGAR);
+
+  // ----------------------------------------------------------------------
+  // Matrículas: por que existe uma trava aqui
+  // ----------------------------------------------------------------------
+  // Apagar o conteúdo do curso, no Moodle, passa pela mesma função que apaga
+  // as matrículas. Quem decide é um ajuste do assistente:
+  //
+  //   restore_controller: $options['keep_roles_and_enrolments'] =
+  //                           $this->get_setting_value('keep_roles_and_enrolments');
+  //   remove_course_contents: // Remove roles and enrolments by default.
+  //                           if (empty($options['keep_roles_and_enrolments'])) {
+  //                               enrol_course_delete($course, $userid);
+  //                               role_unassign_all(...);
+  //
+  // Ou seja: com esse ajuste desmarcado, apagar o conteúdo leva os alunos
+  // junto. O padrão dele vem de uma configuração do servidor, que pode estar
+  // de um jeito ou de outro. Por isso o script marca o ajuste, confere que
+  // conseguiu marcar antes de deixar a restauração rodar, e ainda compara a
+  // quantidade de matriculados antes e depois.
+  const RE_AJUSTE_DE_MATRICULAS = /keep_roles_and_enrolments/i;
+  const RE_AJUSTE_DE_GRUPOS = /keep_groups_and_groupings/i;
 
   const ORIGEM = location.origin;
   const abs = (u) => new URL(u, ORIGEM).href;
@@ -385,10 +414,11 @@
 
   function formularioDeDestino(doc) {
     if (!doc) return null;
+    const alvo = alvoEscolhido();
     const candidatos = [...doc.querySelectorAll('form')].filter((f) =>
-      f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`) && !ehFormularioDeBusca(f));
+      f.querySelector(`input[name="target"][value="${alvo}"]`) && !ehFormularioDeBusca(f));
     const comEscolha = candidatos.find((f) =>
-      (f.querySelector(`input[name="target"][value="${ALVO_MESCLAR}"]`).type || '').toLowerCase() === 'radio');
+      (f.querySelector(`input[name="target"][value="${alvo}"]`).type || '').toLowerCase() === 'radio');
     return comEscolha || candidatos[0] || null;
   }
 
@@ -432,8 +462,24 @@
     return dados;
   }
 
+  // Devolve { mexeu, viuAjusteDeMatriculas, ehTelaDeAjustes } para quem chama
+  // decidir se pode seguir.
   function ajustaDadosDaEtapa(dados, form, anota) {
-    let mexeu = [];
+    const mexeu = [];
+    let viuAjusteDeMatriculas = false;
+
+    // O nome do campo muda de prefixo entre versões (setting_root_… /
+    // setting_course_…), então procuro pelo miolo do nome.
+    for (const campo of form.querySelectorAll('input[name], select[name]')) {
+      if (RE_AJUSTE_DE_MATRICULAS.test(campo.name)) {
+        dados.set(campo.name, '1');
+        viuAjusteDeMatriculas = true;
+        if (!mexeu.includes('manter as matrículas e os papéis')) mexeu.push('manter as matrículas e os papéis');
+      } else if (RE_AJUSTE_DE_GRUPOS.test(campo.name)) {
+        dados.set(campo.name, '1');
+        if (!mexeu.includes('manter os grupos')) mexeu.push('manter os grupos');
+      }
+    }
 
     for (const nome of AJUSTES_DE_USUARIO) {
       if (form.querySelector(`[name="${nome}"]`)) { dados.set(nome, '0'); mexeu.push(nome.replace('setting_root_', '')); }
@@ -445,6 +491,30 @@
       mexeu.push('sem sobrescrever a configuração da sala');
     }
     if (anota && mexeu.length) anota(`   mantendo a sala como está: ${mexeu.join(', ')}`);
+
+    // A tela de ajustes é a que traz os "setting_root_…". É nela que o ajuste
+    // de matrículas tem de aparecer quando o destino apaga o conteúdo.
+    const ehTelaDeAjustes = !!form.querySelector('[name^="setting_root_"]');
+    return { mexeu, viuAjusteDeMatriculas, ehTelaDeAjustes };
+  }
+
+  // ----------------------------------------------------------------------
+  // Quantos alunos a sala tem (antes e depois)
+  // ----------------------------------------------------------------------
+  async function contaMatriculados(courseid) {
+    const r = await baixaPagina(`${ORIGEM}/user/index.php?id=${courseid}&perpage=5000`);
+    if (!r.doc) return null;
+
+    // O Moodle escreve "N participantes encontrados" acima da tabela; quando
+    // não escreve, conto as linhas com link para perfil.
+    const texto = txt(r.doc.querySelector('#region-main') || r.doc.body);
+    const m = texto.match(/(\d+)\s+participantes?\s+encontrad/i) || texto.match(/(\d+)\s+participants?\s+found/i);
+    if (m) return Number(m[1]);
+
+    const tabela = r.doc.querySelector('table#participants') || r.doc.querySelector('#participantsform table');
+    if (!tabela) return null;
+    return [...tabela.querySelectorAll('tbody tr')]
+      .filter((tr) => tr.querySelector('a[href*="/user/view.php"], a[href*="/user/profile.php"]')).length;
   }
 
   async function enviaFormulario(form, urlAtual, ajusta) {
@@ -460,7 +530,25 @@
     return { url: resp.url || acao, doc: new DOMParser().parseFromString(html, 'text/html') };
   }
 
+  const precisaDoAjusteDeMatriculas = () =>
+    CONFIG.exigirManterMatriculas && CONFIG.modoDeRestauracao !== 'mesclar';
+
+  // A última tela do assistente é a de revisão, cujo botão executa a
+  // restauração — é a partir dela que a sala é alterada.
+  const RE_BOTAO_QUE_EXECUTA = /executar|perform|realizar|restaurar agora/i;
+
+  function ehEtapaQueExecuta(form) {
+    const botao = botaoDeAvancar(form);
+    if (!botao) return false;
+    return RE_BOTAO_QUE_EXECUTA.test(txt(botao) || botao.value || '');
+  }
+
   async function restaura(curso, arquivo, anota, pararNoDestino) {
+    let viuAjusteDeMatriculas = false;
+
+    const matriculadosAntes = CONFIG.conferirMatriculasDepois ? await contaMatriculados(curso.id) : null;
+    if (matriculadosAntes !== null) anota(`   matriculados antes: ${matriculadosAntes}`);
+
     const ctxId = await contextoDoCurso(curso.id);
     if (!ctxId) throw new Error('não achei o id de contexto da sala');
 
@@ -501,7 +589,17 @@
     let escolheuDestino = false;
     for (let etapa = 1; etapa <= CONFIG.maxEtapas; etapa++) {
       if (terminou(doc)) {
-        return { assincrono: RE_ASSINCRONO.test(txt(doc.querySelector('#region-main') || doc.body)) };
+        const assincrono = RE_ASSINCRONO.test(txt(doc.querySelector('#region-main') || doc.body));
+        const matriculadosDepois = matriculadosAntes !== null && !assincrono
+          ? await contaMatriculados(curso.id) : null;
+        if (matriculadosDepois !== null) {
+          anota(`   matriculados depois: ${matriculadosDepois}`);
+          if (matriculadosDepois < matriculadosAntes) {
+            throw new Error(`ALUNOS PERDIDOS: a sala tinha ${matriculadosAntes} matriculados e ficou com ` +
+              `${matriculadosDepois}. Interrompi tudo para não repetir isso nas outras salas.`);
+          }
+        }
+        return { assincrono, matriculadosAntes, matriculadosDepois };
       }
 
       const destino = formularioDeDestino(doc);
@@ -511,9 +609,11 @@
           anota('   diagnóstico: paro aqui. NADA foi restaurado nesta sala.', 'ok');
           return { diagnostico: true };
         }
-        anota('   destino: mesclar com esta sala (sem apagar nada, sem mexer nas matrículas)');
+        anota(CONFIG.modoDeRestauracao === 'mesclar'
+          ? '   destino: mesclar com esta sala (soma ao que já existe)'
+          : '   destino: apagar o conteúdo desta sala e restaurar por cima');
         ({ url: urlAtual, doc } = await enviaFormulario(destino, urlAtual, (dados) => {
-          dados.set('target', ALVO_MESCLAR);
+          dados.set('target', alvoEscolhido());
         }));
         escolheuDestino = true;
       } else {
@@ -526,6 +626,24 @@
             : `não reconheci a tela da etapa ${etapa} — ${descreveTela(doc)}`);
         }
         if (pararNoDestino) anota(`   etapa ${etapa} — ${descreveTela(doc)}`);
+
+        // Antes de enviar, olho a tela: se for a de ajustes e o campo que
+        // preserva as matrículas não estiver lá, paro aqui. Até este ponto
+        // nada foi apagado — quem apaga é a etapa final.
+        const previa = ajustaDadosDaEtapa(new FormData(), atual, null);
+        if (precisaDoAjusteDeMatriculas() && previa.ehTelaDeAjustes && !previa.viuAjusteDeMatriculas) {
+          throw new Error('não achei o ajuste "manter as matrículas e os papéis" na tela de ajustes. ' +
+            'Apagar o conteúdo sem ele tira os alunos da sala, então parei antes de executar — ' +
+            'nada foi apagado. Restaure esta sala pela tela do Moodle ou use modoDeRestauracao: \'mesclar\'.');
+        }
+        if (previa.viuAjusteDeMatriculas) viuAjusteDeMatriculas = true;
+
+        // A etapa que executa não pode rodar sem essa confirmação.
+        if (precisaDoAjusteDeMatriculas() && !viuAjusteDeMatriculas && ehEtapaQueExecuta(atual)) {
+          throw new Error('cheguei na etapa que executa a restauração sem ter visto o ajuste que ' +
+            'preserva as matrículas. Parei antes de executar — nada foi apagado.');
+        }
+
         ({ url: urlAtual, doc } = await enviaFormulario(atual, urlAtual, (dados, f) => ajustaDadosDaEtapa(dados, f, anota)));
       }
 
@@ -552,12 +670,18 @@
       caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(520px,92vw);
         box-shadow:0 12px 40px rgba(0,0,0,.3);`;
 
-      const avisoConteudo = contagem.itens
-        ? `<div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;padding:8px;color:#6b4e00;margin-bottom:12px;">
-             Esta sala <strong>já tem ${contagem.itens} item(ns)</strong>. Mesclar soma o backup ao que está lá —
-             se o conteúdo já tiver sido restaurado antes, ele vai aparecer em dobro.
+      const apagando = CONFIG.modoDeRestauracao !== 'mesclar';
+      const avisoConteudo = apagando
+        ? `<div style="background:#fdecea;border:1px solid #f3b8b2;border-radius:6px;padding:8px;color:#8c1e18;margin-bottom:12px;">
+             O conteúdo que está hoje nesta sala <strong>vai ser apagado</strong>${contagem.itens ? ` (${contagem.itens} item(ns))` : ''}
+             e substituído pelo conteúdo do backup. Isso não tem desfazer.
            </div>`
-        : '';
+        : (contagem.itens
+            ? `<div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;padding:8px;color:#6b4e00;margin-bottom:12px;">
+                 Esta sala <strong>já tem ${contagem.itens} item(ns)</strong>. Mesclar soma o backup ao que está lá —
+                 se o conteúdo já tiver sido restaurado antes, ele vai aparecer em dobro.
+               </div>`
+            : '');
 
       caixa.innerHTML = `
         <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Sala ${indice} de ${total}</div>
@@ -566,7 +690,8 @@
         <ul style="margin:6px 0 12px 18px;padding:0;color:#333;"><li><code>${arquivo.name}</code></li></ul>
         ${avisoConteudo}
         <div style="background:#eef3ff;border:1px solid #c9d8f5;border-radius:6px;padding:8px;color:#22407e;margin-bottom:12px;">
-          O conteúdo é <strong>somado</strong> à sala: nada é apagado e as matrículas dos alunos não mudam.
+          Os <strong>alunos matriculados continuam como estão</strong> — o script marca o ajuste que preserva
+          matrículas e papéis, e confere a quantidade antes e depois.
           A restauração roda no servidor e demora; deixe a aba aberta.
         </div>
         <label style="display:flex;gap:6px;align-items:center;color:#555;margin-bottom:14px;">
@@ -673,7 +798,10 @@
           if (somenteConferir) {
             registro.estado = 'restauraria';
             registro.observacao = `${arquivo.name}${contagem.itens ? ` — a sala já tem ${contagem.itens} item(ns)` : ''}`;
-            log(`   ok: ${arquivo.name} → esta sala${contagem.itens ? ` (já tem ${contagem.itens} item(ns))` : ''}`);
+            log(`   ok: ${arquivo.name} → esta sala` +
+                (CONFIG.modoDeRestauracao === 'mesclar'
+                  ? `${contagem.itens ? ` (soma aos ${contagem.itens} item(ns) que já estão lá)` : ''}`
+                  : `${contagem.itens ? ` (apaga os ${contagem.itens} item(ns) que estão lá)` : ' (sala já vazia)'}`));
             continue;
           }
 
@@ -686,6 +814,9 @@
           const resultado = await restaura(curso, arquivo, (m) => log(m));
           registro.estado = 'restaurada';
           registro.observacao = arquivo.name;
+          if (resultado.matriculadosDepois !== null && resultado.matriculadosDepois !== undefined) {
+            registro.observacao += ` — ${resultado.matriculadosDepois} matriculados (antes: ${resultado.matriculadosAntes})`;
+          }
           log(`   restaurada: ${arquivo.name}`, 'ok');
 
           if (resultado.assincrono) {
@@ -696,6 +827,12 @@
           registro.estado = 'erro';
           registro.observacao = e.message;
           log(`   erro: ${e.message}`, 'erro');
+          // Perder matrícula é o único erro que não pode se repetir sala a
+          // sala: para tudo na hora.
+          if (/^ALUNOS PERDIDOS/.test(e.message)) {
+            log('PAREI TUDO. Confira esta sala antes de seguir.', 'erro');
+            interromper = true;
+          }
         }
         await dorme(CONFIG.pausaMs);
       }
@@ -777,6 +914,7 @@
 
   const titulo = document.createElement('div');
   titulo.textContent = 'Restaurar backups nas salas';
+  // (o modo — apagar ou mesclar — fica em CONFIG.modoDeRestauracao)
   titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
 
   const entrada = document.createElement('input');
