@@ -255,21 +255,54 @@
   // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
   // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
   // ali que o material está: nesse caso o item conta como conteúdo.
+  //
+  // O mesmo vale para link que está na seção mas fora de qualquer atividade,
+  // como no resumo/descrição da seção: para o aluno, é material do mesmo jeito.
+  //
+  // "Fora do Moodle" é decidido pelo endereço. Isso importa: a própria seção
+  // tem links de menu, permalink e edição, todos do site — se qualquer link
+  // contasse, toda seção passaria a ter conteúdo e a conferência perderia o
+  // sentido.
   const HOSPEDEIRO = location.host;
 
-  function temLinkExterno(item) {
-    for (const a of item.querySelectorAll('a[href]')) {
-      const href = a.getAttribute('href') || '';
-      if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
-      let alvo;
-      try { alvo = new URL(href, ORIGEM); } catch (e) { continue; }
-      if (!/^https?:$/.test(alvo.protocol)) continue;
-      if (alvo.host && alvo.host !== HOSPEDEIRO) return true;
-    }
-    // Endereço escrito no texto sem virar link também vale.
-    const escrito = txt(item).match(/https?:\/\/([^\s/]+)/i);
-    return !!(escrito && escrito[1] !== HOSPEDEIRO);
+  function ehEnderecoExterno(href) {
+    if (!href || /^(#|mailto:|tel:|javascript:)/i.test(href)) return false;
+    let alvo;
+    try { alvo = new URL(href, ORIGEM); } catch (e) { return false; }
+    if (!/^https?:$/.test(alvo.protocol)) return false;
+    return !!alvo.host && alvo.host !== HOSPEDEIRO;
   }
+
+  function linksExternosEm(no) {
+    const achados = new Set();
+    if (!no) return achados;
+    no.querySelectorAll('a[href]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      if (ehEnderecoExterno(href)) achados.add(new URL(href, ORIGEM).href);
+    });
+    // Endereço escrito no texto, sem virar link.
+    const texto = txt(no) || '';
+    (texto.match(/https?:\/\/[^\s<>"')]+/gi) || []).forEach((u) => {
+      if (ehEnderecoExterno(u)) achados.add(u);
+    });
+    return achados;
+  }
+
+  const temLinkExterno = (item) => linksExternosEm(item).size > 0;
+
+  // Links da seção que não estão dentro de nenhuma atividade (resumo da seção,
+  // por exemplo). As atividades saem do clone porque já foram contadas uma a
+  // uma, e os controles da seção saem para não entrarem como material.
+  function linksExternosSoltos(secao) {
+    const clone = secao.cloneNode(true);
+    clone.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+      .forEach((n) => n.remove());
+    clone.querySelectorAll('.controlmenu, .menu, .dropdown, .action-menu, button, [role="button"], ' +
+      '.sr-only, .accesshide, .visually-hidden, .section_action_menu, .sectionbadges')
+      .forEach((n) => n.remove());
+    return [...linksExternosEm(clone)];
+  }
+
 
   // ----------------------------------------------------------------------
   // Leitura de TODAS as seções de um curso, seja qual for o nome delas
@@ -293,11 +326,13 @@
 
       let conteudo = 0, rotulos = 0, ocultos = 0, ignoradosPorTipo = 0;
       const tiposConteudo = {};
+      const itensVistos = [];
       for (const item of itens) {
         const classe = item.className || '';
         const mtipo = (classe.match(/modtype_(\w+)/) || [])[1] || '';
         const ehRotulo = /modtype_label|\blabel\b/.test(classe);
         const ehTipoIgnorado = CONFIG.tiposIgnorados.includes(mtipo.toLowerCase());
+        itensVistos.push(mtipo || '(sem tipo)');
         const escondido = /\bhidden\b|dimmed/.test(classe) ||
           /OCULTO|N[ÃA]O DISPON[ÍI]VEL|HIDDEN FROM STUDENTS/.test(norm(txt(item.querySelector('.badge, .availabilityinfo')) || ''));
         if (escondido) ocultos++;
@@ -311,10 +346,19 @@
         }
       }
 
+      // Links que estão na seção mas fora das atividades — o resumo da seção,
+      // tipicamente. Cada um conta como um material.
+      const soltos = CONFIG.linksExternosContamComoConteudo ? linksExternosSoltos(sec) : [];
+      if (soltos.length) {
+        conteudo += soltos.length;
+        tiposConteudo['Link externo'] = (tiposConteudo['Link externo'] || 0) + soltos.length;
+      }
+
       const secaoOculta = /\bhidden\b|dimmed/.test(sec.className || '') ||
         /OCULTO PARA|HIDDEN FROM STUDENTS/.test(norm(txt(sec.querySelector('.badge, .section_availability')) || ''));
 
-      return { nome, conteudo, rotulos, ocultos, ignoradosPorTipo, secaoOculta, totalItens: itens.length, tiposConteudo };
+      return { nome, conteudo, rotulos, ocultos, ignoradosPorTipo, secaoOculta,
+               totalItens: itens.length, tiposConteudo, itensVistos, linksSoltos: soltos.length };
     });
   }
 
@@ -478,7 +522,9 @@
       if (s.secaoOculta) estado = 'oculta';
       else if (s.conteudo === 0) estado = 'vazia';
       else estado = 'com conteúdo';
-      return { nome: s.nome, estado, itens: s.conteudo, ocultos: s.ocultos, ignoradosPorTipo: s.ignoradosPorTipo || 0, tiposConteudo: s.tiposConteudo || {} };
+      return { nome: s.nome, estado, itens: s.conteudo, ocultos: s.ocultos,
+               ignoradosPorTipo: s.ignoradosPorTipo || 0, tiposConteudo: s.tiposConteudo || {},
+               itensVistos: s.itensVistos || [], linksSoltos: s.linksSoltos || 0 };
     });
 
     const comConteudo = secoes.filter((s) => s.estado === 'com conteúdo');
@@ -535,7 +581,12 @@
             const linhas = r.secoes.map((s) => {
               const nota = s.ignoradosPorTipo ? ` (${s.ignoradosPorTipo} item(ns) de tipo ignorado, ex.: fórum)` : '';
               if (s.estado === 'oculta') return `${s.nome}: oculta (${s.itens} itens)${nota}`;
-              if (s.estado === 'vazia') return `${s.nome}: vazia${nota}`;
+              // Numa seção vazia, digo o que foi visto: é isso que mostra se a
+              // conferência errou ou se a seção está vazia mesmo.
+              if (s.estado === 'vazia') {
+                const vistos = s.itensVistos.length ? s.itensVistos.join(', ') : 'nenhum item';
+                return `${s.nome}: vazia (vi: ${vistos}; ${s.linksSoltos} link(s) externo(s) fora das atividades)${nota}`;
+              }
               const composicao = formataTipos(s.tiposConteudo);
               return `${s.nome}: ${s.itens} item(ns) — ${composicao}${s.ocultos ? ` (+${s.ocultos} ocultos)` : ''}${nota}`;
             });

@@ -111,20 +111,52 @@
   // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
   // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
   // ali que o material está: nesse caso o item conta como conteúdo.
+  //
+  // O mesmo vale para link que está na seção mas fora de qualquer atividade,
+  // como no resumo/descrição da seção: para o aluno, é material do mesmo jeito.
+  //
+  // "Fora do Moodle" é decidido pelo endereço. Isso importa: a própria seção
+  // tem links de menu, permalink e edição, todos do site — se qualquer link
+  // contasse, toda seção passaria a ter conteúdo e a conferência perderia o
+  // sentido.
   const HOSPEDEIRO = location.host;
 
-  function temLinkExterno(item) {
-    for (const a of item.querySelectorAll('a[href]')) {
+  function ehEnderecoExterno(href) {
+    if (!href || /^(#|mailto:|tel:|javascript:)/i.test(href)) return false;
+    let alvo;
+    try { alvo = new URL(href, ORIGEM); } catch (e) { return false; }
+    if (!/^https?:$/.test(alvo.protocol)) return false;
+    return !!alvo.host && alvo.host !== HOSPEDEIRO;
+  }
+
+  function linksExternosEm(no) {
+    const achados = new Set();
+    if (!no) return achados;
+    no.querySelectorAll('a[href]').forEach((a) => {
       const href = a.getAttribute('href') || '';
-      if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
-      let alvo;
-      try { alvo = new URL(href, ORIGEM); } catch (e) { continue; }
-      if (!/^https?:$/.test(alvo.protocol)) continue;
-      if (alvo.host && alvo.host !== HOSPEDEIRO) return true;
-    }
-    // Endereço escrito no texto sem virar link também vale.
-    const escrito = txt(item).match(/https?:\/\/([^\s/]+)/i);
-    return !!(escrito && escrito[1] !== HOSPEDEIRO);
+      if (ehEnderecoExterno(href)) achados.add(new URL(href, ORIGEM).href);
+    });
+    // Endereço escrito no texto, sem virar link.
+    const texto = txt(no) || '';
+    (texto.match(/https?:\/\/[^\s<>"')]+/gi) || []).forEach((u) => {
+      if (ehEnderecoExterno(u)) achados.add(u);
+    });
+    return achados;
+  }
+
+  const temLinkExterno = (item) => linksExternosEm(item).size > 0;
+
+  // Links da seção que não estão dentro de nenhuma atividade (resumo da seção,
+  // por exemplo). As atividades saem do clone porque já foram contadas uma a
+  // uma, e os controles da seção saem para não entrarem como material.
+  function linksExternosSoltos(secao) {
+    const clone = secao.cloneNode(true);
+    clone.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+      .forEach((n) => n.remove());
+    clone.querySelectorAll('.controlmenu, .menu, .dropdown, .action-menu, button, [role="button"], ' +
+      '.sr-only, .accesshide, .visually-hidden, .section_action_menu, .sectionbadges')
+      .forEach((n) => n.remove());
+    return [...linksExternosEm(clone)];
   }
 
   // ----------------------------------------------------------------------
@@ -155,6 +187,9 @@
         if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
         itens++;
       }
+
+      // Links fora das atividades (resumo da seção) também são material.
+      if (CONFIG.linksExternosContamComoConteudo) itens += linksExternosSoltos(secao).length;
     }
     return { secoes: secoes.length, itens };
   }
