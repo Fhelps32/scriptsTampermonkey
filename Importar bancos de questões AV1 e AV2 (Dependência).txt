@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Importar bancos de questões AV1/AV2 (Dependência UGB)
+// @name         Importar bancos de questões AV1 e AV2 (Dependência)
 // @namespace    https://dependencia.ugb.edu.br/
-// @version      1.0
-// @description  Importa os XMLs exportados de um período para os bancos das salas do período novo
+// @version      1.1
+// @description  Onde usar: abra na Dependência a categoria com a lista das salas do semestre NOVO e use o painel no canto da tela. Manda para os bancos dessas salas os arquivos XML baixados do semestre anterior. O botão Diagnosticar mostra a situação de cada banco, em resumo e em planilha.
 // @author       Você
 // @match        https://dependencia.ugb.edu.br/course/index.php*
 // @icon         https://dependencia.ugb.edu.br/favicon.ico
@@ -25,6 +25,15 @@
     notasProximas: false,                     // false = "erro se a nota não bater" (padrão do Moodle)
     pararNoErro: 1,
     pausaMs: 1000,
+    // Resultado do diagnóstico
+    // Em que nível da trilha de categorias está o nome do curso, contando a
+    // partir do primeiro nível abaixo de "Cursos". Na estrutura do NEAD:
+    //   Cursos / 2026.2 / Campus Volta Redonda / Engenharia Civil / Com Avaliação
+    //              1º             2º                    3º                4º
+    // ou seja, o curso é o 3º nível.
+    nivelDoCurso: 3,
+    baixarCsvAoFinal: true,                   // gera a planilha assim que a varredura termina
+    separadorCsv: ';',                        // ';' é o que o Excel em português abre já em colunas
     repoIdUpload: null,                       // preencha só se o script não achar sozinho
     usarIframe: true,
     esperaIframeMs: 12000,
@@ -34,6 +43,7 @@
   const abs = (u) => new URL(u, ORIGEM).href;
   const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
   const txt = (el) => (el.textContent || '').replace(/\u00a0/g, ' ').trim();
+  const limpaNome = (s) => s.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
 
   // Chave de comparação entre nome de arquivo e nome de curso.
   // Tira [26.1], [ADP-DEP], (VR-DIR.M), acentos, símbolos e espaços.
@@ -527,88 +537,332 @@
     return m ? parseInt(m[1], 10) : null;
   }
 
+  // ----------------------------------------------------------------------
+  // Varredura: uma linha por sala, com a contagem de questões de cada
+  // categoria. É daqui que saem o resumo copiável e a planilha.
+  // ----------------------------------------------------------------------
+  function rotuloDaCategoria(regex) {
+    return (regex.source.match(/AV\d/i) || ['?'])[0].toUpperCase();
+  }
+
+  function nomeCurto(nome) {
+    return nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*⬩.*$/, '').trim();
+  }
+
   async function varreduraBancos(cursos) {
     log('');
     log('Situação dos bancos nesta categoria:');
-    const vazios = [], parciais = [], semBanco = [];
+    if (!arquivosPorChave.size) {
+      log('   (nenhum XML selecionado: as colunas "Arquivo AV1/AV2" da planilha vão sair em branco)', 'aviso');
+    }
+    const linhas = [];
+    const nomeDoCurso = nomeDoCursoDaTrilha();
 
     for (const curso of cursos) {
       if (interromper) { log('Varredura interrompida.', 'aviso'); break; }
-      const curto = curso.nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*⬩.*$/, '').trim();
+      const curto = nomeCurto(curso.nome);
+      const arquivos = arquivosPorChave.get(chave(curso.nome)) || {};
+
+      const linha = {
+        curto, nomeDoCurso,
+        url: `${ORIGEM}/course/view.php?id=${curso.id}`,
+        contagem: {}, total: 0, estado: 'erro', observacoes: [],
+        arquivos: Object.fromEntries(Object.entries(arquivos).map(([k, v]) => [k, v.name])),
+      };
+      linhas.push(linha);
 
       try {
         const { link } = await localizaBanco(curso.id, null);
-        if (!link) { log(`   ${curto}: sem banco`, 'erro'); semBanco.push(curto); continue; }
-
-        const cfg = await paginaImportacao(link, curso.id, null);
-        if (!cfg) { log(`   ${curto}: banco sem página de importação`, 'erro'); semBanco.push(curto); continue; }
-
-        const partes = [];
-        let total = 0, encontradas = 0;
-        for (const regex of CONFIG.categorias) {
-          const rotulo = (regex.source.match(/AV\d/i) || ['?'])[0].toUpperCase();
-          const opcao = achaOpcao(cfg.doc, regex);
-          if (!opcao) { partes.push(`${rotulo}: não existe`); continue; }
-          encontradas++;
-          const n = contaQuestoes(txt(opcao));
-          partes.push(`${rotulo}: ${n === null ? '?' : n}`);
-          total += n || 0;
+        if (!link) {
+          linha.estado = 'sem banco';
+          linha.observacoes.push('nenhum banco encontrado');
+          log(`   ${curto}: sem banco`, 'erro');
+          continue;
         }
 
-        const estado = total === 0 ? 'vazio' : (encontradas < CONFIG.categorias.length || partes.some((p) => /: 0$/.test(p)) ? 'incompleto' : 'ok');
-        log(`   ${curto}: ${partes.join(' · ')} → ${estado}`, estado === 'ok' ? 'ok' : 'aviso');
-        if (estado === 'vazio') vazios.push(curto);
-        else if (estado === 'incompleto') parciais.push(curto);
+        const cfg = await paginaImportacao(link, curso.id, null);
+        if (!cfg) {
+          linha.estado = 'sem banco';
+          linha.observacoes.push('banco sem página de importação');
+          log(`   ${curto}: banco sem página de importação`, 'erro');
+          continue;
+        }
+
+        const partes = [];
+        let encontradas = 0, algumaZerada = false;
+        for (const regex of CONFIG.categorias) {
+          const rotulo = rotuloDaCategoria(regex);
+          const opcao = achaOpcao(cfg.doc, regex);
+          if (!opcao) {
+            linha.contagem[rotulo] = null;
+            linha.observacoes.push(`${rotulo}: categoria não existe no destino`);
+            partes.push(`${rotulo}: não existe`);
+            continue;
+          }
+          encontradas++;
+          const n = contaQuestoes(txt(opcao));
+          linha.contagem[rotulo] = n;
+          partes.push(`${rotulo}: ${n === null ? '?' : n}`);
+          if (n === null) linha.observacoes.push(`${rotulo}: o Moodle não mostrou a contagem`);
+          if (n === 0) algumaZerada = true;
+          linha.total += n || 0;
+        }
+
+        linha.estado = linha.total === 0
+          ? 'vazio'
+          : (encontradas < CONFIG.categorias.length || algumaZerada ? 'incompleto' : 'ok');
+        log(`   ${curto}: ${partes.join(' · ')} → ${linha.estado}`, linha.estado === 'ok' ? 'ok' : 'aviso');
       } catch (e) {
+        linha.estado = 'erro';
+        linha.observacoes.push(e.message);
         log(`   ${curto}: erro ao ler (${e.message})`, 'erro');
       }
       await dorme(CONFIG.pausaMs);
     }
 
+    const nomes = (estado) => linhas.filter((l) => l.estado === estado).map((l) => l.curto);
     log('');
-    log(`Vazios (${vazios.length}): ${vazios.join(' | ') || '—'}`, vazios.length ? 'aviso' : 'ok');
-    log(`Incompletos (${parciais.length}): ${parciais.join(' | ') || '—'}`, parciais.length ? 'aviso' : 'ok');
-    if (semBanco.length) log(`Sem banco (${semBanco.length}): ${semBanco.join(' | ')}`, 'erro');
+    for (const [estado, rotulo] of [['vazio', 'Vazios'], ['incompleto', 'Incompletos']]) {
+      const lista = nomes(estado);
+      log(`${rotulo} (${lista.length}): ${lista.join(' | ') || '—'}`, lista.length ? 'aviso' : 'ok');
+    }
+    if (nomes('sem banco').length) log(`Sem banco (${nomes('sem banco').length}): ${nomes('sem banco').join(' | ')}`, 'erro');
+    if (nomes('erro').length) log(`Não foi possível ler (${nomes('erro').length}): ${nomes('erro').join(' | ')}`, 'erro');
+
+    return linhas;
+  }
+
+  // ----------------------------------------------------------------------
+  // Resultado do diagnóstico: resumo copiável e planilha
+  // ----------------------------------------------------------------------
+  const ESTADOS = [
+    ['ok', 'BANCOS COMPLETOS'],
+    ['incompleto', 'BANCOS INCOMPLETOS'],
+    ['vazio', 'BANCOS VAZIOS'],
+    ['sem banco', 'SEM BANCO'],
+    ['erro', 'NÃO FOI POSSÍVEL LER'],
+  ];
+
+  let ultimoDiagnostico = null;
+
+  // Nome da categoria aberta (a folha da trilha), pelo título da página.
+  const RE_TITULO_GENERICO = /^(categorias?( de)? cursos?|cursos?|course categories)$/i;
+
+  function nomeDaCategoria() {
+    const candidatos = [
+      document.querySelector('.page-header-headings h1'),
+      document.querySelector('#region-main h1'),
+      document.querySelector('h1'),
+    ];
+    for (const el of candidatos) {
+      const nome = el ? txt(el) : '';
+      if (nome && !RE_TITULO_GENERICO.test(nome)) return nome;
+    }
+    return (document.title || '').split(/\s*[|–]\s*/)[0].trim();
+  }
+
+  // Só os níveis de categoria da trilha, de fora para dentro. Um item entra
+  // quando é a categoria atual (sem link) ou quando aponta para uma categoria;
+  // assim "Cursos", "Página inicial" e "Painel" ficam de fora e a contagem de
+  // níveis não muda de um tema para outro.
+  //   Cursos / 2026.2 / Campus Volta Redonda / Engenharia Civil / Com Avaliação
+  //   ->  ['2026.2', 'Campus Volta Redonda', 'Engenharia Civil', 'Com Avaliação']
+  function trilhaDeCategorias() {
+    const itens = [...document.querySelectorAll(
+      '#page-navbar .breadcrumb-item, nav .breadcrumb li, ol.breadcrumb li')];
+    const niveis = [];
+    for (const item of itens) {
+      const nome = txt(item);
+      if (!nome || niveis.includes(nome)) continue;
+      const link = item.querySelector('a[href]');
+      if (link) {
+        const alvo = new URL(link.getAttribute('href'), ORIGEM);
+        const ehCategoria = /\/course\/index\.php/.test(alvo.pathname) && alvo.searchParams.get('categoryid');
+        if (!ehCategoria) continue;
+      }
+      niveis.push(nome);
+    }
+    return niveis;
+  }
+
+  // O curso fica num nível fixo da trilha (CONFIG.nivelDoCurso). Se a trilha
+  // for mais curta que isso, o mais específico que existe já é o curso.
+  function nomeDoCursoDaTrilha() {
+    const trilha = trilhaDeCategorias();
+    if (!trilha.length) return nomeDaCategoria();
+    return trilha[CONFIG.nivelDoCurso - 1] || trilha[trilha.length - 1];
+  }
+
+  // "Engenharia Civil - Com Avaliação": o curso e a pasta em que ele foi lido.
+  function descricaoDoLocal() {
+    const trilha = trilhaDeCategorias();
+    const curso = nomeDoCursoDaTrilha();
+    const atual = trilha.length ? trilha[trilha.length - 1] : nomeDaCategoria();
+    if (curso && atual && curso !== atual) return `${curso} - ${atual}`;
+    return curso || atual || '';
+  }
+
+  function contagemEmTexto(linha) {
+    return Object.entries(linha.contagem)
+      .map(([rotulo, n]) => `${rotulo}: ${n === null ? 'não existe' : n}`)
+      .join(' · ');
+  }
+
+  function textoResumo(d) {
+    const linhas = [];
+    linhas.push(`DIAGNÓSTICO DOS BANCOS${d.categoria ? ` — ${d.categoria}` : ''}`);
+    linhas.push(d.quando);
+    linhas.push(`${d.linhas.length} sala(s) verificada(s).`);
+
+    if (d.detalhes.length) {
+      linhas.push('');
+      linhas.push('SALA DE REFERÊNCIA');
+      d.detalhes.forEach((l) => linhas.push(`  ${l}`));
+    }
+
+    for (const [estado, titulo] of ESTADOS) {
+      const itens = d.linhas.filter((l) => l.estado === estado);
+      if (!itens.length) continue;
+      linhas.push('');
+      linhas.push(`${titulo} (${itens.length})`);
+      for (const l of itens) {
+        const contagem = contagemEmTexto(l);
+        const obs = l.observacoes.length ? ` — ${l.observacoes.join(' · ')}` : '';
+        linhas.push(`  - ${l.curto}${contagem ? `: ${contagem}` : ''}${obs}`);
+      }
+    }
+    return linhas.join('\n');
+  }
+
+  // Cada célula entre aspas, com as aspas internas dobradas: nome de matéria
+  // costuma ter vírgula e ponto e vírgula, que quebrariam a coluna.
+  function celulaCsv(valor) {
+    const texto = valor === null || valor === undefined ? '' : String(valor);
+    return `"${texto.replace(/"/g, '""')}"`;
+  }
+
+  function csvDoDiagnostico(d) {
+    const rotulos = CONFIG.categorias.map(rotuloDaCategoria);
+    const cabecalho = [
+      'Matéria', 'Curso', 'URL',
+      ...rotulos, 'Total', 'Situação',
+      ...rotulos.map((r) => `Arquivo ${r}`),
+      'Observações',
+    ];
+    const corpo = d.linhas.map((l) => [
+      l.curto, l.nomeDoCurso, l.url,
+      ...rotulos.map((r) => (l.contagem[r] === null || l.contagem[r] === undefined ? '' : l.contagem[r])),
+      l.total, l.estado,
+      ...rotulos.map((r) => l.arquivos[r] || ''),
+      l.observacoes.join(' · '),
+    ]);
+
+    // O BOM na frente é o que faz o Excel entender os acentos; \r\n é a
+    // quebra de linha que ele espera.
+    return '\ufeff' + [cabecalho, ...corpo]
+      .map((linha) => linha.map(celulaCsv).join(CONFIG.separadorCsv))
+      .join('\r\n');
+  }
+
+  function nomeDoArquivo(extensao) {
+    const agora = new Date();
+    const dd = (n) => String(n).padStart(2, '0');
+    const carimbo = `${agora.getFullYear()}-${dd(agora.getMonth() + 1)}-${dd(agora.getDate())} ${dd(agora.getHours())}${dd(agora.getMinutes())}`;
+    const categoria = limpaNome(descricaoDoLocal()).slice(0, 60);
+    return `${limpaNome(`diagnostico bancos${categoria ? ` - ${categoria}` : ''} - ${carimbo}`)}.${extensao}`;
+  }
+
+  function baixaBlob(blob, nome) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = nome;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  function baixarCsv() {
+    if (!ultimoDiagnostico) { log('Rode o diagnóstico antes de baixar a planilha.', 'aviso'); return; }
+    const nome = nomeDoArquivo('csv');
+    baixaBlob(new Blob([csvDoDiagnostico(ultimoDiagnostico)], { type: 'text/csv;charset=utf-8' }), nome);
+    log(`Planilha gerada: ${nome}`, 'ok');
+  }
+
+  function copiarResumo() {
+    if (!ultimoDiagnostico) { log('Rode o diagnóstico antes de copiar o resumo.', 'aviso'); return; }
+    navigator.clipboard.writeText(textoResumo(ultimoDiagnostico))
+      .then(() => log('Resumo copiado para a área de transferência.', 'ok'))
+      .catch(() => log('Não consegui copiar automaticamente — selecione o texto no painel.', 'aviso'));
+  }
+
+  // ----------------------------------------------------------------------
+  // Diagnóstico
+  // ----------------------------------------------------------------------
+  // Inspeção detalhada da primeira sala: confere se o script acha banco,
+  // formulário e repositório de upload. As linhas anotadas entram no resumo.
+  async function inspecionaPrimeiroCurso(curso, anota) {
+    anota(`Sala de referência: ${curso.nome} (id ${curso.id})`);
+    anota(`Chave do curso: ${chave(curso.nome)}`);
+
+    const { link, nomes } = await localizaBanco(curso.id, (m) => log(m));
+    if (!link) { anota(`Sem banco. Nomes vistos: ${(nomes || []).join(' | ') || '(nenhum)'}`, 'erro'); return; }
+    anota(`Banco: "${link.texto}" — cmid ${link.cmid}`, 'ok');
+
+    const cfg = await paginaImportacao(link, curso.id, (m) => log(m));
+    if (!cfg) { anota('Sem página de importação.', 'erro'); return; }
+
+    if (!cfg.repoId) {
+      const achado = await descobreRepoUpload(cfg.url, (m) => log(m));
+      cfg.repoId = achado.repoId;
+      cfg.ctxId = cfg.ctxId || achado.ctxId;
+    }
+    anota(`draftitemid ${cfg.itemid} · repo upload ${cfg.repoId} · contexto ${cfg.ctxId}`, cfg.repoId ? 'ok' : 'erro');
+    if (!cfg.repoId) anota('Abra a importação manualmente, veja o id na URL do seletor e ponha em repoIdUpload.', 'aviso');
+
+    const opcoes = [...cfg.doc.querySelectorAll('select[name="category"] option')];
+    anota(`Categorias de destino (${opcoes.length}):`);
+    opcoes.slice(0, 20).forEach((o) => anota(`   · ${txt(o)}  [${o.value}]`));
+
+    if (arquivosPorChave.size) {
+      const arqs = arquivosPorChave.get(chave(curso.nome));
+      anota(arqs ? `Arquivos casados: ${Object.entries(arqs).map(([k, v]) => `${k}=${v.name}`).join(' | ')}`
+                 : 'Nenhum arquivo casou com esta matéria.', arqs ? 'ok' : 'aviso');
+    } else {
+      anota('Nenhum arquivo selecionado ainda.', 'aviso');
+    }
   }
 
   async function diagnosticar() {
     if (rodando) return;
     rodando = true; interromper = false; travaBotoes(true); botaoParar.style.display = '';
+    botaoCopiar.style.display = 'none'; botaoCsv.style.display = 'none';
+
     try {
       const cursos = await listarCursos();
       log(`${cursos.length} cursos na categoria.`);
       if (!cursos.length) return;
-      const curso = cursos[0];
-      log(`Testando: ${curso.nome} (id ${curso.id})`);
-      log(`Chave do curso: ${chave(curso.nome)}`);
 
-      const { link, nomes } = await localizaBanco(curso.id, (m) => log(m));
-      if (!link) { log(`Sem banco. Nomes vistos: ${(nomes || []).join(' | ') || '(nenhum)'}`, 'erro'); return; }
-      log(`Banco: "${link.texto}" — cmid ${link.cmid}`, 'ok');
+      const detalhes = [];
+      const anota = (msg, tipo) => { log(msg, tipo); detalhes.push(msg); };
 
-      const cfg = await paginaImportacao(link, curso.id, (m) => log(m));
-      if (!cfg) { log('Sem página de importação.', 'erro'); return; }
-      if (!cfg.repoId) {
-        const achado = await descobreRepoUpload(cfg.url, (m) => log(m));
-        cfg.repoId = achado.repoId;
-        cfg.ctxId = cfg.ctxId || achado.ctxId;
-      }
-      log(`draftitemid ${cfg.itemid} · repo upload ${cfg.repoId} · contexto ${cfg.ctxId}`, cfg.repoId ? 'ok' : 'erro');
-      if (!cfg.repoId) log('Abra a importação manualmente, veja o id na URL do seletor e ponha em repoIdUpload.', 'aviso');
+      // A varredura roda mesmo que a sala de referência falhe: é ela que
+      // produz a planilha, e o problema de uma sala não vale por todas.
+      await inspecionaPrimeiroCurso(cursos[0], anota);
+      const linhas = await varreduraBancos(cursos);
 
-      const opcoes = [...cfg.doc.querySelectorAll('select[name="category"] option')];
-      log(`Categorias de destino (${opcoes.length}):`);
-      opcoes.slice(0, 20).forEach((o) => log(`   · ${txt(o)}  [${o.value}]`));
+      ultimoDiagnostico = {
+        quando: new Date().toLocaleString('pt-BR'),
+        categoria: descricaoDoLocal(),
+        detalhes,
+        linhas,
+      };
 
-      if (arquivosPorChave.size) {
-        const arqs = arquivosPorChave.get(chave(curso.nome));
-        log(arqs ? `Arquivos casados: ${Object.entries(arqs).map(([k, v]) => `${k}=${v.name}`).join(' | ')}`
-                 : 'Nenhum arquivo casou com esta matéria.', arqs ? 'ok' : 'aviso');
-      } else {
-        log('Nenhum arquivo selecionado ainda.', 'aviso');
-      }
-
-      await varreduraBancos(cursos);
+      botaoCopiar.style.display = '';
+      botaoCsv.style.display = '';
+      log('');
+      log('Resumo pronto: "Copiar resumo" para o texto, "Baixar CSV" para a planilha.', 'ok');
+      if (CONFIG.baixarCsvAoFinal && linhas.length) baixarCsv();
     } catch (e) {
       log(`Erro: ${e.message}`, 'erro');
     } finally {
@@ -651,10 +905,17 @@
   const botao = criaBotao('Importar', '#28a745', () => executar(false));
   const botaoTeste = criaBotao('Só conferir', '#5a6673', () => executar(true));
   const botaoDiag = criaBotao('Diagnosticar', '#2d5bd0', diagnosticar);
+  const botaoCopiar = criaBotao('Copiar resumo', '#5b21b6', copiarResumo);
+  botaoCopiar.style.display = 'none';
+  const botaoCsv = criaBotao('Baixar CSV', '#0f766e', baixarCsv);
+  botaoCsv.style.display = 'none';
   const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
   botaoParar.style.display = 'none';
 
-  const travaBotoes = (t) => { botao.disabled = botaoTeste.disabled = botaoDiag.disabled = t; };
+  const travaBotoes = (t) => {
+    botao.disabled = botaoTeste.disabled = botaoDiag.disabled = t;
+    botaoCopiar.disabled = botaoCsv.disabled = t;
+  };
 
   const painelLog = document.createElement('div');
   painelLog.style.cssText = 'margin-top:8px;max-height:340px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';

@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auditar material de apoio (NEAD UGB)
+// @name         Conferir material de apoio das salas (NEAD)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.0
-// @description  Verifica se cada sala da categoria tem conteúdo em QUALQUER seção, e resume quais têm material e quais estão vazias
+// @version      2.1
+// @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias e quem é o professor de cada uma.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @icon         https://nead.ugb.edu.br/favicon.ico
@@ -26,10 +26,21 @@
       /MATERIAL DE APOIO DA FINAL\b/,
     ],
     rotulosContamComoConteudo: false, // um mod_label (texto solto) conta como material?
+    // Rótulo com link para fora do Moodle (Drive, YouTube…) conta: o material
+    // está no link, não no Moodle.
+    linksExternosContamComoConteudo: true,
     // Tipos de atividade que NÃO contam como material de estudo, mesmo que
     // existam na seção. Se só sobrar isso numa seção, ela é tratada como vazia.
     // Nomes técnicos do Moodle (o que vem depois de "modtype_" na classe do item).
     tiposIgnorados: ['forum'],
+    // Professor da sala: lido na página de participantes do curso.
+    mostrarProfessores: true,
+    // Papéis que contam como professor. A comparação é feita sem acento, em
+    // maiúsculas e sobre cada papel isoladamente, então /^PROFESSOR$/ casa com
+    // "Professor" mas não com "Professor não editor" nem com "Tutor".
+    // Para incluir outros papéis, acrescente aqui (ex.: /^PROFESSOR NAO EDITOR$/).
+    papeisProfessor: [/^PROFESSOR(A)?$/],
+    participantesPorPagina: 200,
     pausaMs: 600,
     usarIframe: true,                 // fallback quando a página do curso é montada por JS
     esperaIframeMs: 12000,
@@ -240,6 +251,59 @@
     return '';
   }
 
+
+  // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
+  // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
+  // ali que o material está: nesse caso o item conta como conteúdo.
+  //
+  // O mesmo vale para link que está na seção mas fora de qualquer atividade,
+  // como no resumo/descrição da seção: para o aluno, é material do mesmo jeito.
+  //
+  // "Fora do Moodle" é decidido pelo endereço. Isso importa: a própria seção
+  // tem links de menu, permalink e edição, todos do site — se qualquer link
+  // contasse, toda seção passaria a ter conteúdo e a conferência perderia o
+  // sentido.
+  const HOSPEDEIRO = location.host;
+
+  function ehEnderecoExterno(href) {
+    if (!href || /^(#|mailto:|tel:|javascript:)/i.test(href)) return false;
+    let alvo;
+    try { alvo = new URL(href, ORIGEM); } catch (e) { return false; }
+    if (!/^https?:$/.test(alvo.protocol)) return false;
+    return !!alvo.host && alvo.host !== HOSPEDEIRO;
+  }
+
+  function linksExternosEm(no) {
+    const achados = new Set();
+    if (!no) return achados;
+    no.querySelectorAll('a[href]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      if (ehEnderecoExterno(href)) achados.add(new URL(href, ORIGEM).href);
+    });
+    // Endereço escrito no texto, sem virar link.
+    const texto = txt(no) || '';
+    (texto.match(/https?:\/\/[^\s<>"')]+/gi) || []).forEach((u) => {
+      if (ehEnderecoExterno(u)) achados.add(u);
+    });
+    return achados;
+  }
+
+  const temLinkExterno = (item) => linksExternosEm(item).size > 0;
+
+  // Links da seção que não estão dentro de nenhuma atividade (resumo da seção,
+  // por exemplo). As atividades saem do clone porque já foram contadas uma a
+  // uma, e os controles da seção saem para não entrarem como material.
+  function linksExternosSoltos(secao) {
+    const clone = secao.cloneNode(true);
+    clone.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+      .forEach((n) => n.remove());
+    clone.querySelectorAll('.controlmenu, .menu, .dropdown, .action-menu, button, [role="button"], ' +
+      '.sr-only, .accesshide, .visually-hidden, .section_action_menu, .sectionbadges')
+      .forEach((n) => n.remove());
+    return [...linksExternosEm(clone)];
+  }
+
+
   // ----------------------------------------------------------------------
   // Leitura de TODAS as seções de um curso, seja qual for o nome delas
   // ----------------------------------------------------------------------
@@ -262,28 +326,171 @@
 
       let conteudo = 0, rotulos = 0, ocultos = 0, ignoradosPorTipo = 0;
       const tiposConteudo = {};
+      const itensVistos = [];
       for (const item of itens) {
         const classe = item.className || '';
         const mtipo = (classe.match(/modtype_(\w+)/) || [])[1] || '';
         const ehRotulo = /modtype_label|\blabel\b/.test(classe);
         const ehTipoIgnorado = CONFIG.tiposIgnorados.includes(mtipo.toLowerCase());
+        itensVistos.push(mtipo || '(sem tipo)');
         const escondido = /\bhidden\b|dimmed/.test(classe) ||
           /OCULTO|N[ÃA]O DISPON[ÍI]VEL|HIDDEN FROM STUDENTS/.test(norm(txt(item.querySelector('.badge, .availabilityinfo')) || ''));
         if (escondido) ocultos++;
+        const porLinkExterno = CONFIG.linksExternosContamComoConteudo && ehRotulo && temLinkExterno(item);
         if (ehTipoIgnorado) { ignoradosPorTipo++; continue; } // ex.: fórum não conta como material de estudo
-        if (ehRotulo && !CONFIG.rotulosContamComoConteudo) continue;
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
         if (!escondido) {
           conteudo++;
-          const tipo = tipoDoItem(item, mtipo);
+          const tipo = porLinkExterno ? 'Link externo' : tipoDoItem(item, mtipo);
           tiposConteudo[tipo] = (tiposConteudo[tipo] || 0) + 1;
         }
+      }
+
+      // Links que estão na seção mas fora das atividades — o resumo da seção,
+      // tipicamente. Cada um conta como um material.
+      const soltos = CONFIG.linksExternosContamComoConteudo ? linksExternosSoltos(sec) : [];
+      if (soltos.length) {
+        conteudo += soltos.length;
+        tiposConteudo['Link externo'] = (tiposConteudo['Link externo'] || 0) + soltos.length;
       }
 
       const secaoOculta = /\bhidden\b|dimmed/.test(sec.className || '') ||
         /OCULTO PARA|HIDDEN FROM STUDENTS/.test(norm(txt(sec.querySelector('.badge, .section_availability')) || ''));
 
-      return { nome, conteudo, rotulos, ocultos, ignoradosPorTipo, secaoOculta, totalItens: itens.length, tiposConteudo };
+      return { nome, conteudo, rotulos, ocultos, ignoradosPorTipo, secaoOculta,
+               totalItens: itens.length, tiposConteudo, itensVistos, linksSoltos: soltos.length };
     });
+  }
+
+  // ----------------------------------------------------------------------
+  // Professores da sala (página de participantes do curso)
+  // ----------------------------------------------------------------------
+  function temTabelaParticipantes(doc) {
+    return !!doc && !!doc.querySelector('#participants, #participantsform, table#participants, [data-table-uniqueid*="participants"]');
+  }
+
+  function linhasParticipantes(doc) {
+    if (!doc) return [];
+    const tabela =
+      doc.querySelector('table#participants') ||
+      doc.querySelector('#participantsform table') ||
+      doc.querySelector('#region-main table.generaltable') ||
+      doc.querySelector('table.generaltable');
+    if (!tabela) return [];
+    return [...tabela.querySelectorAll('tbody tr')].filter((tr) => linksDeParticipante(tr).length);
+  }
+
+  // O avatar do participante é um link para o perfil igual ao do nome, e
+  // quando o usuário não tem foto o Moodle desenha as iniciais como TEXTO
+  // ("FD"). Sem tirar isso, o "nome" do professor viraria as iniciais — e dois
+  // professores sem foto virariam um só.
+  const SELETOR_AVATAR = '.userpicture, .userinitials, .avatar, .initials, img, svg';
+
+  function linksDeParticipante(linha) {
+    return [...linha.querySelectorAll('a[href*="/user/view.php"], a[href*="/user/profile.php"]')];
+  }
+
+  function nomeDoParticipante(linha) {
+    for (const link of linksDeParticipante(linha)) {
+      const clone = link.cloneNode(true);
+      clone.querySelectorAll(SELETOR_AVATAR).forEach((n) => n.remove());
+      const nome = txt(clone);
+      if (nome) return nome;
+    }
+    return '';
+  }
+
+  function ehPapelProfessor(papel) {
+    const n = norm(papel);
+    return !!n && CONFIG.papeisProfessor.some((re) => re.test(n));
+  }
+
+  // Ícones e textos de leitor de tela que ficam grudados no nome do papel
+  // ("Papéis", "Editar papéis", o lápis de edição) e estragariam a comparação
+  // exata. Atenção: NÃO dá para remover os links aqui — no "inplace editable"
+  // do Moodle o nome do papel fica dentro do próprio link de edição.
+  const SELETOR_CONTROLES_CELULA =
+    '.quickediticon, .editinstructions, img, i.icon, .sr-only, .sr-only-focusable, ' +
+    '.accesshide, .visually-hidden, button, input, select, .action-menu, .dropdown, .menu';
+
+  // Devolve os papéis do participante, um por item da lista.
+  // A coluna "Papéis" aparece em três formatos, dependendo da versão/tema:
+  //   1. inplace editable — <span class="displayvalue">Professor</span> dentro
+  //      do link do lápis (é o formato do Moodle 4.x/5 em uso aqui);
+  //   2. um badge/li por papel;
+  //   3. texto solto, com os papéis separados por vírgula.
+  function papeisDaCelula(celula) {
+    const clone = celula.cloneNode(true);
+    clone.querySelectorAll(SELETOR_CONTROLES_CELULA).forEach((n) => n.remove());
+
+    const editaveis = [...clone.querySelectorAll('.displayvalue')];
+    const marcados = editaveis.length ? editaveis : [...clone.querySelectorAll('.badge, li, .role')];
+    const textos = marcados.length ? marcados.map((n) => txt(n)) : [txt(clone)];
+
+    return textos
+      .flatMap((t) => t.split(/[,;\n\u00b7|]+/))
+      .map((t) => t.trim())
+      .filter(Boolean);
+  }
+
+  // Além dos nomes, devolvo os papéis que apareceram na tabela: quando nenhum
+  // professor é encontrado, é isso que mostra se o problema foi a leitura da
+  // página ou se a sala realmente não tem ninguém com o papel esperado.
+  function extraiProfessores(linhas) {
+    const nomes = [];
+    const papeisVistos = new Set();
+    for (const linha of linhas) {
+      const nome = nomeDoParticipante(linha);
+      if (!nome) continue;
+      const celulasDoNome = linksDeParticipante(linha).map((a) => a.closest('td, th'));
+      const celulas = [...linha.querySelectorAll('td, th')].filter((c) => !celulasDoNome.includes(c));
+
+      let ehProfessor = false;
+      for (const celula of celulas) {
+        for (const papel of papeisDaCelula(celula)) {
+          if (!ehPapelProfessor(papel)) continue;
+          ehProfessor = true;
+          papeisVistos.add(papel);
+        }
+      }
+      if (!ehProfessor) {
+        const celulaPapeis = celulas.find((c) => c.querySelector('[data-itemtype="user_roles"], [data-region="roles"]'));
+        if (celulaPapeis) papeisDaCelula(celulaPapeis).forEach((p) => papeisVistos.add(p));
+        continue;
+      }
+      if (!nomes.includes(nome)) nomes.push(nome);
+    }
+    return {
+      nomes: nomes.sort((a, b) => a.localeCompare(b, 'pt')),
+      papeisVistos: [...papeisVistos],
+    };
+  }
+
+  // Devolve { nomes, lido }: "lido" separa "a sala não tem professor" de
+  // "não consegui abrir a lista de participantes" (sem permissão, erro etc.).
+  async function listaProfessores(courseid) {
+    const url = `${ORIGEM}/user/index.php?id=${courseid}&perpage=${CONFIG.participantesPorPagina}`;
+    const r = await baixaPagina(url);
+    let doc = r.doc;
+    let linhas = linhasParticipantes(doc);
+
+    // Sem nenhuma linha, tento de novo dentro de um iframe: em parte das
+    // versões a tabela de participantes só é montada por JavaScript.
+    if (!linhas.length && CONFIG.usarIframe) {
+      const comJs = await carregaComJs(url, (d) => linhasParticipantes(d).length > 0);
+      if (comJs && linhasParticipantes(comJs).length) { doc = comJs; linhas = linhasParticipantes(comJs); }
+    }
+
+    if (!linhas.length) return { nomes: [], papeisVistos: [], lido: temTabelaParticipantes(doc) };
+    return { ...extraiProfessores(linhas), lido: true };
+  }
+
+  function textoProfessores(r) {
+    const p = (r && r.professores) || { nomes: [], papeisVistos: [], lido: false };
+    if (!p.lido) return 'não foi possível ler os participantes';
+    if (p.nomes.length) return p.nomes.join(', ');
+    const vistos = (p.papeisVistos || []).join(', ');
+    return vistos ? `sem professor atribuído (papéis na sala: ${vistos})` : 'sem professor atribuído';
   }
 
   async function leCurso(curso) {
@@ -296,9 +503,13 @@
       brutas = achaSecoes(doc);
     }
 
+    const professores = CONFIG.mostrarProfessores
+      ? await listaProfessores(curso.id)
+      : { nomes: [], papeisVistos: [], lido: false };
+
     const ignoradas = brutas.filter((s) => ehSecaoIgnorada(s.nome));
     const secoes = brutas.filter((s) => !ehSecaoIgnorada(s.nome));
-    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome) };
+    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome), professores };
   }
 
   // ----------------------------------------------------------------------
@@ -311,7 +522,9 @@
       if (s.secaoOculta) estado = 'oculta';
       else if (s.conteudo === 0) estado = 'vazia';
       else estado = 'com conteúdo';
-      return { nome: s.nome, estado, itens: s.conteudo, ocultos: s.ocultos, ignoradosPorTipo: s.ignoradosPorTipo || 0, tiposConteudo: s.tiposConteudo || {} };
+      return { nome: s.nome, estado, itens: s.conteudo, ocultos: s.ocultos,
+               ignoradosPorTipo: s.ignoradosPorTipo || 0, tiposConteudo: s.tiposConteudo || {},
+               itensVistos: s.itensVistos || [], linksSoltos: s.linksSoltos || 0 };
     });
 
     const comConteudo = secoes.filter((s) => s.estado === 'com conteúdo');
@@ -325,7 +538,11 @@
     else if (comConteudo.length) estado = 'com conteúdo';
     else estado = 'sem conteúdo';
 
-    return { curso, url: leitura.url, secoes, estado, seguePadrao, ignoradas: leitura.ignoradas || [] };
+    return {
+      curso, url: leitura.url, secoes, estado, seguePadrao,
+      ignoradas: leitura.ignoradas || [],
+      professores: leitura.professores || { nomes: [], lido: false },
+    };
   }
 
   // ----------------------------------------------------------------------
@@ -356,13 +573,20 @@
           const tipo = r.estado === 'com conteúdo' ? 'ok' : (r.estado === 'ilegível' ? 'erro' : 'aviso');
           log(curto, tipo);
 
+          if (CONFIG.mostrarProfessores) log(`   Professor(es): ${textoProfessores(r)}`);
+
           if (r.ignoradas.length) log(`   (ignorando: ${r.ignoradas.join(' | ')})`);
 
           if (r.secoes.length) {
             const linhas = r.secoes.map((s) => {
               const nota = s.ignoradosPorTipo ? ` (${s.ignoradosPorTipo} item(ns) de tipo ignorado, ex.: fórum)` : '';
               if (s.estado === 'oculta') return `${s.nome}: oculta (${s.itens} itens)${nota}`;
-              if (s.estado === 'vazia') return `${s.nome}: vazia${nota}`;
+              // Numa seção vazia, digo o que foi visto: é isso que mostra se a
+              // conferência errou ou se a seção está vazia mesmo.
+              if (s.estado === 'vazia') {
+                const vistos = s.itensVistos.length ? s.itensVistos.join(', ') : 'nenhum item';
+                return `${s.nome}: vazia (vi: ${vistos}; ${s.linksSoltos} link(s) externo(s) fora das atividades)${nota}`;
+              }
               const composicao = formataTipos(s.tiposConteudo);
               return `${s.nome}: ${s.itens} item(ns) — ${composicao}${s.ocultos ? ` (+${s.ocultos} ocultos)` : ''}${nota}`;
             });
@@ -373,7 +597,10 @@
           log(`   → ${r.estado}${r.seguePadrao ? ' · estrutura padrão' : ''}`, tipo);
         } catch (e) {
           log(`${curto}: erro ao ler (${e.message})`, 'erro');
-          relatorio.push({ curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro', secoes: [], seguePadrao: false });
+          relatorio.push({
+            curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro',
+            secoes: [], seguePadrao: false, professores: { nomes: [], papeisVistos: [], lido: false },
+          });
         }
         await dorme(CONFIG.pausaMs);
       }
@@ -390,6 +617,13 @@
 
   function nomeCurto(curso) {
     return curso.nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+  }
+
+  // Uma linha por sala no resumo, já com o(s) professor(es) da matéria.
+  function linhaSala(indentacao, r) {
+    const nome = nomeCurto(r.curso);
+    if (!CONFIG.mostrarProfessores) return `${indentacao}- ${nome}`;
+    return `${indentacao}- ${nome} — Professor(es): ${textoProfessores(r)}`;
   }
 
   function linhasDetalheSala(r) {
@@ -410,19 +644,19 @@
     linhas.push(`SALAS COM CONTEÚDO (${comConteudo.length})`);
     if (padrao.length) {
       linhas.push(`  estrutura padrão (${padrao.length}):`);
-      padrao.forEach((r) => { linhas.push(`    - ${nomeCurto(r.curso)}`); linhas.push(...linhasDetalheSala(r)); });
+      padrao.forEach((r) => { linhas.push(linhaSala('    ', r)); linhas.push(...linhasDetalheSala(r)); });
     }
     if (foraPadrao.length) {
       linhas.push(`  fora do padrão, mas com material (${foraPadrao.length}):`);
-      foraPadrao.forEach((r) => { linhas.push(`    - ${nomeCurto(r.curso)}`); linhas.push(...linhasDetalheSala(r)); });
+      foraPadrao.forEach((r) => { linhas.push(linhaSala('    ', r)); linhas.push(...linhasDetalheSala(r)); });
     }
     linhas.push('');
     linhas.push(`SALAS SEM CONTEÚDO (${semConteudo.length})`);
-    semConteudo.forEach((r) => linhas.push(`  - ${nomeCurto(r.curso)}`));
+    semConteudo.forEach((r) => linhas.push(linhaSala('  ', r)));
     if (ilegiveis.length) {
       linhas.push('');
       linhas.push(`NÃO FOI POSSÍVEL VERIFICAR (${ilegiveis.length})`);
-      ilegiveis.forEach((r) => linhas.push(`  - ${nomeCurto(r.curso)}`));
+      ilegiveis.forEach((r) => linhas.push(linhaSala('  ', r)));
     }
     return linhas.join('\n');
   }
