@@ -62,11 +62,17 @@
   //                               enrol_course_delete($course, $userid);
   //                               role_unassign_all(...);
   //
-  // Ou seja: com esse ajuste desmarcado, apagar o conteúdo leva os alunos
-  // junto. O padrão dele vem de uma configuração do servidor, que pode estar
-  // de um jeito ou de outro. Por isso o script marca o ajuste, confere que
-  // conseguiu marcar antes de deixar a restauração rodar, e ainda compara a
-  // quantidade de matriculados antes e depois.
+  // Ou seja: com esse ajuste em "Não", apagar o conteúdo leva os alunos junto.
+  //
+  // O ajuste é criado em restore_course_task, então é do CURSO e não da raiz:
+  // o campo se chama setting_course_keep_roles_and_enrolments, é um select
+  // Sim/Não com padrão NÃO, e aparece na tela de ajustes do curso — a mesma de
+  // "Sobrescrever a configuração do curso", que vem DEPOIS da tela de ajustes
+  // gerais. Ele só existe quando o destino escolhido apaga o conteúdo.
+  //
+  // Por isso o script marca o ajuste, confere que conseguiu marcar antes de
+  // deixar a restauração rodar, e ainda compara a quantidade de matriculados
+  // antes e depois.
   const RE_AJUSTE_DE_MATRICULAS = /keep_roles_and_enrolments/i;
   const RE_AJUSTE_DE_GRUPOS = /keep_groups_and_groupings/i;
 
@@ -492,10 +498,10 @@
     }
     if (anota && mexeu.length) anota(`   mantendo a sala como está: ${mexeu.join(', ')}`);
 
-    // A tela de ajustes é a que traz os "setting_root_…". É nela que o ajuste
-    // de matrículas tem de aparecer quando o destino apaga o conteúdo.
-    const ehTelaDeAjustes = !!form.querySelector('[name^="setting_root_"]');
-    return { mexeu, viuAjusteDeMatriculas, ehTelaDeAjustes };
+    // A tela de ajustes do curso é a que traz os "setting_course_…". É nela
+    // que o ajuste de matrículas aparece quando o destino apaga o conteúdo.
+    const ehTelaDoCurso = !!form.querySelector('[name^="setting_course_"]');
+    return { mexeu, viuAjusteDeMatriculas, ehTelaDoCurso };
   }
 
   // ----------------------------------------------------------------------
@@ -543,7 +549,7 @@
     return RE_BOTAO_QUE_EXECUTA.test(txt(botao) || botao.value || '');
   }
 
-  async function restaura(curso, arquivo, anota, pararNoDestino) {
+  async function restaura(curso, arquivo, anota, pararAntesDeExecutar) {
     let viuAjusteDeMatriculas = false;
 
     const matriculadosAntes = CONFIG.conferirMatriculasDepois ? await contaMatriculados(curso.id) : null;
@@ -572,14 +578,14 @@
     const repoId = await descobreRepoUpload(urlRestauracao, r.html);
     if (!repoId) throw new Error('não achei o repositório de envio (preencha repoIdUpload no CONFIG)');
 
-    if (pararNoDestino) {
+    if (pararAntesDeExecutar) {
       anota(`   envio: campo "${campo.name}" (rascunho ${campo.value}), repositório ${repoId}, sesskey ${sesskey ? 'ok' : 'NÃO ACHEI'}`);
       anota(`   ${descreveTela(doc)}`);
     }
 
     anota(`   enviando ${arquivo.name}…`);
     const envio = await enviaParaRascunho(arquivo, { itemid: campo.value, repoId, ctxId, sesskey });
-    if (pararNoDestino) anota(`   o Moodle aceitou o arquivo: ${JSON.stringify(envio).slice(0, 200)}`);
+    if (pararAntesDeExecutar) anota(`   o Moodle aceitou o arquivo: ${JSON.stringify(envio).slice(0, 200)}`);
 
     ({ url: urlAtual, doc } = await enviaFormulario(form, urlAtual));
     let erro = mensagemDeErro(doc);
@@ -604,11 +610,7 @@
 
       const destino = formularioDeDestino(doc);
       if (destino) {
-        if (pararNoDestino) {
-          anota(`   cheguei na tela de destino — ${descreveTela(doc)}`);
-          anota('   diagnóstico: paro aqui. NADA foi restaurado nesta sala.', 'ok');
-          return { diagnostico: true };
-        }
+        if (pararAntesDeExecutar) anota(`   tela de destino — ${descreveTela(doc)}`);
         anota(CONFIG.modoDeRestauracao === 'mesclar'
           ? '   destino: mesclar com esta sala (soma ao que já existe)'
           : '   destino: apagar o conteúdo desta sala e restaurar por cima');
@@ -625,16 +627,26 @@
             ? `o Moodle voltou para a tela de envio do arquivo — ${descreveTela(doc)}`
             : `não reconheci a tela da etapa ${etapa} — ${descreveTela(doc)}`);
         }
-        if (pararNoDestino) anota(`   etapa ${etapa} — ${descreveTela(doc)}`);
+        if (pararAntesDeExecutar) anota(`   etapa ${etapa} — ${descreveTela(doc)}`);
+
+        // O diagnóstico percorre as telas e para na última antes da que
+        // executa: até aqui o Moodle não apagou nem restaurou nada.
+        if (pararAntesDeExecutar && ehEtapaQueExecuta(atual)) {
+          anota(`   esta é a tela que executa ("${txt(botaoDeAvancar(atual)) || botaoDeAvancar(atual).value}")`);
+          anota(`   ajuste de matrículas encontrado pelo caminho: ${viuAjusteDeMatriculas ? 'SIM' : 'NÃO'}`,
+                viuAjusteDeMatriculas ? 'ok' : 'erro');
+          anota('   diagnóstico: paro aqui. NADA foi apagado nem restaurado nesta sala.', 'ok');
+          return { diagnostico: true };
+        }
 
         // Antes de enviar, olho a tela: se for a de ajustes e o campo que
         // preserva as matrículas não estiver lá, paro aqui. Até este ponto
         // nada foi apagado — quem apaga é a etapa final.
         const previa = ajustaDadosDaEtapa(new FormData(), atual, null);
-        if (precisaDoAjusteDeMatriculas() && previa.ehTelaDeAjustes && !previa.viuAjusteDeMatriculas) {
-          throw new Error('não achei o ajuste "manter as matrículas e os papéis" na tela de ajustes. ' +
-            'Apagar o conteúdo sem ele tira os alunos da sala, então parei antes de executar — ' +
-            'nada foi apagado. Restaure esta sala pela tela do Moodle ou use modoDeRestauracao: \'mesclar\'.');
+        if (precisaDoAjusteDeMatriculas() && previa.ehTelaDoCurso && !previa.viuAjusteDeMatriculas) {
+          throw new Error('a tela de ajustes do curso veio sem o campo "Manter as funções e inscrições atuais". ' +
+            'Apagar o conteúdo sem ele tira os alunos da sala, então parei antes de executar — nada foi apagado. ' +
+            'Use modoDeRestauracao: \'mesclar\' ou restaure esta sala pela tela do Moodle.');
         }
         if (previa.viuAjusteDeMatriculas) viuAjusteDeMatriculas = true;
 
@@ -728,6 +740,8 @@
   // ----------------------------------------------------------------------
   let rodando = false, interromper = false;
   let relatorio = [];
+  // Guardado fora da execução porque o resumo copiado também precisa dele.
+  let sobraramArquivos = [];
 
   // Vai até a tela de destino e para. Serve para descobrir onde o caminho
   // quebra sem restaurar nada: até essa tela, a sala não é tocada.
@@ -837,7 +851,8 @@
         await dorme(CONFIG.pausaMs);
       }
 
-      const sobraram = [...arquivosPorChave.keys()].filter((k) => !usados.has(k));
+      sobraramArquivos = [...arquivosPorChave.keys()].filter((k) => !usados.has(k));
+      const sobraram = sobraramArquivos;
       if (sobraram.length) {
         log('');
         log(`${sobraram.length} arquivo(s) sem sala correspondente nesta categoria:`, 'aviso');
@@ -865,7 +880,7 @@
     ['erro', 'COM ERRO'],
   ];
 
-  function textoResumo(sobraram) {
+  function textoResumo(sobraram = sobraramArquivos) {
     const linhas = [`RESTAURAÇÃO DOS BACKUPS — ${new Date().toLocaleString('pt-BR')}`];
     linhas.push(`${relatorio.length} sala(s) percorrida(s).`);
 
