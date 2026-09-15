@@ -26,6 +26,9 @@
       /MATERIAL DE APOIO DA FINAL\b/,
     ],
     rotulosContamComoConteudo: false, // um mod_label (texto solto) conta como material?
+    // Rótulo com link para fora do Moodle (Drive, YouTube…) conta: o material
+    // está no link, não no Moodle.
+    linksExternosContamComoConteudo: true,
     // Tipos de atividade que NÃO contam como material de estudo, mesmo que
     // existam na seção. Se só sobrar isso numa seção, ela é tratada como vazia.
     // Nomes técnicos do Moodle (o que vem depois de "modtype_" na classe do item).
@@ -248,6 +251,26 @@
     return '';
   }
 
+
+  // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
+  // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
+  // ali que o material está: nesse caso o item conta como conteúdo.
+  const HOSPEDEIRO = location.host;
+
+  function temLinkExterno(item) {
+    for (const a of item.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
+      let alvo;
+      try { alvo = new URL(href, ORIGEM); } catch (e) { continue; }
+      if (!/^https?:$/.test(alvo.protocol)) continue;
+      if (alvo.host && alvo.host !== HOSPEDEIRO) return true;
+    }
+    // Endereço escrito no texto sem virar link também vale.
+    const escrito = txt(item).match(/https?:\/\/([^\s/]+)/i);
+    return !!(escrito && escrito[1] !== HOSPEDEIRO);
+  }
+
   // ----------------------------------------------------------------------
   // Leitura de TODAS as seções de um curso, seja qual for o nome delas
   // ----------------------------------------------------------------------
@@ -278,11 +301,12 @@
         const escondido = /\bhidden\b|dimmed/.test(classe) ||
           /OCULTO|N[ÃA]O DISPON[ÍI]VEL|HIDDEN FROM STUDENTS/.test(norm(txt(item.querySelector('.badge, .availabilityinfo')) || ''));
         if (escondido) ocultos++;
+        const porLinkExterno = CONFIG.linksExternosContamComoConteudo && ehRotulo && temLinkExterno(item);
         if (ehTipoIgnorado) { ignoradosPorTipo++; continue; } // ex.: fórum não conta como material de estudo
-        if (ehRotulo && !CONFIG.rotulosContamComoConteudo) continue;
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
         if (!escondido) {
           conteudo++;
-          const tipo = tipoDoItem(item, mtipo);
+          const tipo = porLinkExterno ? 'Link externo' : tipoDoItem(item, mtipo);
           tiposConteudo[tipo] = (tiposConteudo[tipo] || 0) + 1;
         }
       }

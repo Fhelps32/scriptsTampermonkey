@@ -34,6 +34,7 @@
     // material de apoio", para "sala com conteúdo" querer dizer a mesma coisa
     // em todos: fórum não conta, rótulo não conta e item oculto não conta.
     rotulosContamComoConteudo: false,
+    linksExternosContamComoConteudo: true, // rótulo com link para fora do Moodle conta
     tiposIgnorados: ['forum'],
 
     maxEtapas: 12,                // trava: a restauração tem 7 telas, 12 é folga
@@ -154,6 +155,26 @@
     return [...cursos].map(([id, nome]) => ({ id, nome }));
   }
 
+
+  // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
+  // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
+  // ali que o material está: nesse caso o item conta como conteúdo.
+  const HOSPEDEIRO = location.host;
+
+  function temLinkExterno(item) {
+    for (const a of item.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
+      let alvo;
+      try { alvo = new URL(href, ORIGEM); } catch (e) { continue; }
+      if (!/^https?:$/.test(alvo.protocol)) continue;
+      if (alvo.host && alvo.host !== HOSPEDEIRO) return true;
+    }
+    // Endereço escrito no texto sem virar link também vale.
+    const escrito = txt(item).match(/https?:\/\/([^\s/]+)/i);
+    return !!(escrito && escrito[1] !== HOSPEDEIRO);
+  }
+
   // Quanto a sala de destino já tem. Serve de aviso: mesclar soma o backup ao
   // que já está lá, então uma sala com conteúdo pode acabar com tudo em dobro.
   //
@@ -180,8 +201,9 @@
         const escondido = /\bhidden\b|dimmed/.test(classe) ||
           /OCULTO|N[ÃA]O DISPON[ÍI]VEL|HIDDEN FROM STUDENTS/.test(norm(txt(item.querySelector('.badge, .availabilityinfo')) || ''));
 
+        const porLinkExterno = CONFIG.linksExternosContamComoConteudo && ehRotulo && temLinkExterno(item);
         if (CONFIG.tiposIgnorados.includes(mtipo.toLowerCase())) { ignorados++; continue; }
-        if (ehRotulo && !CONFIG.rotulosContamComoConteudo) continue;
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
         if (escondido) { ocultos++; continue; }
         itens++;
       }

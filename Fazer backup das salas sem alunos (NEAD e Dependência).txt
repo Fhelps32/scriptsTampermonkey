@@ -29,6 +29,7 @@
     // backup e a sala não está vazia de verdade.
     pularSalasSemConteudo: true,
     rotulosContamComoConteudo: false, // um texto solto (mod_label) conta como conteúdo?
+    linksExternosContamComoConteudo: true, // rótulo com link para fora do Moodle conta
     tiposIgnorados: ['forum'],        // o que não conta como conteúdo de estudo
 
     pausaMs: 2000,              // o backup roda no servidor: vale dar um tempo entre as salas
@@ -106,6 +107,26 @@
     return [...cursos].map(([id, nome]) => ({ id, nome }));
   }
 
+
+  // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
+  // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
+  // ali que o material está: nesse caso o item conta como conteúdo.
+  const HOSPEDEIRO = location.host;
+
+  function temLinkExterno(item) {
+    for (const a of item.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
+      let alvo;
+      try { alvo = new URL(href, ORIGEM); } catch (e) { continue; }
+      if (!/^https?:$/.test(alvo.protocol)) continue;
+      if (alvo.host && alvo.host !== HOSPEDEIRO) return true;
+    }
+    // Endereço escrito no texto sem virar link também vale.
+    const escrito = txt(item).match(/https?:\/\/([^\s/]+)/i);
+    return !!(escrito && escrito[1] !== HOSPEDEIRO);
+  }
+
   // ----------------------------------------------------------------------
   // A sala tem conteúdo?
   // ----------------------------------------------------------------------
@@ -128,8 +149,10 @@
       for (const item of atividades) {
         const classe = item.className || '';
         const mtipo = (classe.match(/modtype_(\w+)/) || [])[1] || '';
+        const ehRotulo = /modtype_label|\blabel\b/.test(classe);
+        const porLinkExterno = CONFIG.linksExternosContamComoConteudo && ehRotulo && temLinkExterno(item);
         if (CONFIG.tiposIgnorados.includes(mtipo.toLowerCase())) continue;
-        if (/modtype_label|\blabel\b/.test(classe) && !CONFIG.rotulosContamComoConteudo) continue;
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
         itens++;
       }
     }
