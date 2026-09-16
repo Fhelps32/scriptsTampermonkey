@@ -739,18 +739,26 @@
       caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(520px,92vw);
         box-shadow:0 12px 40px rgba(0,0,0,.3);`;
 
+      // O vermelho é para o que não tem volta. Numa sala vazia não há nada a
+      // apagar, então o aviso seria só barulho — e barulho repetido faz a
+      // pessoa parar de ler o que importa.
       const apagando = CONFIG.modoDeRestauracao !== 'mesclar';
-      const avisoConteudo = apagando
-        ? `<div style="background:#fdecea;border:1px solid #f3b8b2;border-radius:6px;padding:8px;color:#8c1e18;margin-bottom:12px;">
-             O conteúdo que está hoje nesta sala <strong>vai ser apagado</strong>${contagem.itens ? ` (${contagem.itens} item(ns))` : ''}
-             e substituído pelo conteúdo do backup. Isso não tem desfazer.
-           </div>`
-        : (contagem.itens
-            ? `<div style="background:#fff6e5;border:1px solid #f0d9a8;border-radius:6px;padding:8px;color:#6b4e00;margin-bottom:12px;">
-                 Esta sala <strong>já tem ${contagem.itens} item(ns)</strong>. Mesclar soma o backup ao que está lá —
-                 se o conteúdo já tiver sido restaurado antes, ele vai aparecer em dobro.
-               </div>`
-            : '');
+      const caixaDeAviso = (fundo, borda, cor, texto) =>
+        `<div style="background:${fundo};border:1px solid ${borda};border-radius:6px;padding:8px;color:${cor};margin-bottom:12px;">${texto}</div>`;
+
+      let avisoConteudo;
+      if (!contagem.itens) {
+        avisoConteudo = caixaDeAviso('#eef7f0', '#c5e2cf', '#177245',
+          'Esta sala está <strong>vazia</strong>: não há conteúdo para apagar. O backup entra numa sala limpa.');
+      } else if (apagando) {
+        avisoConteudo = caixaDeAviso('#fdecea', '#f3b8b2', '#8c1e18',
+          `Esta sala tem <strong>${contagem.itens} item(ns)</strong>, e todos <strong>vão ser apagados</strong> ` +
+          'antes de entrar o conteúdo do backup. Isso não tem desfazer.');
+      } else {
+        avisoConteudo = caixaDeAviso('#fff6e5', '#f0d9a8', '#6b4e00',
+          `Esta sala <strong>já tem ${contagem.itens} item(ns)</strong>. Mesclar soma o backup ao que está lá — ` +
+          'se o conteúdo já tiver sido restaurado antes, ele vai aparecer em dobro.');
+      }
 
       caixa.innerHTML = `
         <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Sala ${indice} de ${total}</div>
@@ -867,8 +875,8 @@
           const contagem = contaConteudo(r.doc);
 
           if (somenteConferir) {
-            registro.estado = 'restauraria';
-            registro.observacao = `${arquivo.name}${contagem.itens ? ` — a sala já tem ${contagem.itens} item(ns)` : ''}`;
+            registro.estado = contagem.itens ? 'restauraria com conteudo' : 'restauraria vazia';
+            registro.observacao = `${arquivo.name}${contagem.itens ? ` — ${contagem.itens} item(ns) na sala hoje` : ''}`;
             log(`   ok: ${arquivo.name} → esta sala` +
                 (CONFIG.modoDeRestauracao === 'mesclar'
                   ? `${contagem.itens ? ` (soma aos ${contagem.itens} item(ns) que já estão lá)` : ''}`
@@ -929,19 +937,25 @@
   // ----------------------------------------------------------------------
   // Resumo
   // ----------------------------------------------------------------------
-  const ESTADOS = [
-    ['restaurada', 'RESTAURADAS'],
-    ['restauraria', 'SALAS PRONTAS PARA RESTAURAR (só conferido)'],
-    ['sem arquivo', 'SEM ARQUIVO CORRESPONDENTE'],
-    ['pulada', 'PULADAS POR VOCÊ'],
-    ['erro', 'COM ERRO'],
-  ];
+  function estados() {
+    const apagando = CONFIG.modoDeRestauracao !== 'mesclar';
+    return [
+      ['restaurada', 'RESTAURADAS'],
+      ['restauraria com conteudo', apagando
+        ? 'SALAS COM CONTEÚDO — VÃO SER APAGADAS E RESTAURADAS'
+        : 'SALAS COM CONTEÚDO — O BACKUP VAI SER SOMADO AO QUE JÁ ESTÁ LÁ'],
+      ['restauraria vazia', 'SALAS VAZIAS — SÓ RECEBEM O CONTEÚDO DO BACKUP'],
+      ['sem arquivo', 'SEM ARQUIVO CORRESPONDENTE (serão puladas)'],
+      ['pulada', 'PULADAS POR VOCÊ'],
+      ['erro', 'COM ERRO'],
+    ];
+  }
 
   function textoResumo(sobraram = sobraramArquivos) {
     const linhas = [`RESTAURAÇÃO DOS BACKUPS — ${new Date().toLocaleString('pt-BR')}`];
     linhas.push(`${relatorio.length} sala(s) percorrida(s).`);
 
-    for (const [estado, titulo] of ESTADOS) {
+    for (const [estado, titulo] of estados()) {
       const itens = relatorio.filter((r) => r.estado === estado);
       if (!itens.length) continue;
       linhas.push('');
@@ -963,8 +977,9 @@
     log('');
     log('════════ RESUMO ════════');
     for (const linha of textoResumo(sobraram).split('\n')) {
-      const tipo = /^RESTAURADAS/.test(linha) ? 'ok'
-        : (/^(SEM ARQUIVO|COM ERRO|PULADAS|ARQUIVOS SEM)/.test(linha) ? 'aviso' : undefined);
+      const tipo = /^(RESTAURADAS|SALAS VAZIAS)/.test(linha) ? 'ok'
+        : (/^SALAS COM CONTEÚDO/.test(linha) ? 'erro'
+          : (/^(SEM ARQUIVO|COM ERRO|PULADAS|ARQUIVOS SEM)/.test(linha) ? 'aviso' : undefined));
       log(linha, tipo);
     }
   }
