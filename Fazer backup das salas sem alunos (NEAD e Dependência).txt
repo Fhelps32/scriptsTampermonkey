@@ -1,0 +1,696 @@
+// ==UserScript==
+// @name         Fazer backup das salas sem alunos (NEAD e Dependência)
+// @namespace    https://nead.ugb.edu.br/
+// @version      1.0
+// @description  Onde usar: abra a categoria com a lista das salas do semestre que vai ser copiado e use o painel no canto da tela. Gera o backup de cada sala SEM os alunos inscritos e baixa o arquivo .mbz. Sala sem conteúdo é pulada.
+// @author       Você
+// @match        https://nead.ugb.edu.br/course/index.php*
+// @match        https://dependencia.ugb.edu.br/course/index.php*
+// @icon         https://nead.ugb.edu.br/favicon.ico
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------------
+  // Ajustes
+  // ----------------------------------------------------------------------
+  const CONFIG = {
+    // Backup
+    semUsuarios: true,          // desmarca "incluir usuários inscritos" e o resto dos dados de aluno
+    baixarArquivo: true,        // baixar o .mbz para o computador, além de gerar na sala
+    pausaEntreDownloadsMs: 1500, // respiro entre downloads: em rajada o navegador bloqueia
+    maxEtapas: 8,               // trava: o assistente do Moodle tem 4 etapas, 8 é folga
+
+    // Conteúdo da sala — mesmas regras do script "Conferir material de apoio".
+    // Diferença: aqui item oculto CONTA como conteúdo, porque ele vai junto no
+    // backup e a sala não está vazia de verdade.
+    pularSalasSemConteudo: true,
+    rotulosContamComoConteudo: false, // um texto solto (mod_label) conta como conteúdo?
+    linksExternosContamComoConteudo: true, // rótulo com link para fora do Moodle conta
+    tiposIgnorados: ['forum'],        // o que não conta como conteúdo de estudo
+
+    pausaMs: 2000,              // o backup roda no servidor: vale dar um tempo entre as salas
+    usarIframe: true,           // fallback quando a página é montada por JavaScript
+    esperaIframeMs: 12000,
+  };
+
+  const ORIGEM = location.origin;
+  const abs = (u) => new URL(u, ORIGEM).href;
+  const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
+  const txt = (el) => (el && el.textContent || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+  const nomeCurto = (nome) => nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
+  const limpaNome = (s) => s.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+
+  // ----------------------------------------------------------------------
+  // Rede
+  // ----------------------------------------------------------------------
+  async function baixaPagina(url) {
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      const html = await resp.text();
+      return { url: resp.url || url, status: resp.status, ok: resp.ok, doc: new DOMParser().parseFromString(html, 'text/html') };
+    } catch (e) {
+      return { url, status: 0, ok: false, doc: null, erro: e.message };
+    }
+  }
+
+  function carregaComJs(url, temOQuePreciso) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;border:0;';
+      frame.src = url;
+      document.body.appendChild(frame);
+      const limite = Date.now() + CONFIG.esperaIframeMs;
+      const timer = setInterval(() => {
+        let doc = null;
+        try { doc = frame.contentDocument; } catch (e) { /* ignora */ }
+        if (doc && doc.readyState === 'complete' && temOQuePreciso(doc)) {
+          clearInterval(timer);
+          const copia = doc.cloneNode(true);
+          setTimeout(() => frame.remove(), 100);
+          resolve(copia);
+          return;
+        }
+        if (Date.now() > limite) {
+          clearInterval(timer);
+          const copia = doc ? doc.cloneNode(true) : null;
+          frame.remove();
+          resolve(copia);
+        }
+      }, 400);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Cursos da categoria aberta
+  // ----------------------------------------------------------------------
+  async function listarCursos() {
+    const paginas = new Map([[location.href, document]]);
+    document.querySelectorAll('.paging a[href], nav a[href*="page="]').forEach((a) => {
+      if (!paginas.has(a.href)) paginas.set(a.href, null);
+    });
+
+    const cursos = new Map();
+    for (const [url, cache] of paginas) {
+      let doc = cache;
+      if (!doc) { const r = await baixaPagina(url); if (!r.doc) continue; doc = r.doc; }
+      const escopo = doc.querySelector('#region-main') || doc.body;
+      escopo.querySelectorAll('a[href*="/course/view.php?id="]').forEach((a) => {
+        const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
+        const nome = txt(a);
+        if (id && nome && !cursos.has(id)) cursos.set(id, nome);
+      });
+    }
+    return [...cursos].map(([id, nome]) => ({ id, nome }));
+  }
+
+
+  // Um rótulo é texto solto e, por si, não é material de estudo. Mas quando ele
+  // traz link para fora do Moodle — Drive, YouTube, um PDF em outro site —, é
+  // ali que o material está: nesse caso o item conta como conteúdo.
+  //
+  // O mesmo vale para link que está na seção mas fora de qualquer atividade,
+  // como no resumo/descrição da seção: para o aluno, é material do mesmo jeito.
+  //
+  // "Fora do Moodle" é decidido pelo endereço. Isso importa: a própria seção
+  // tem links de menu, permalink e edição, todos do site — se qualquer link
+  // contasse, toda seção passaria a ter conteúdo e a conferência perderia o
+  // sentido.
+  const HOSPEDEIRO = location.host;
+
+  function ehEnderecoExterno(href) {
+    if (!href || /^(#|mailto:|tel:|javascript:)/i.test(href)) return false;
+    let alvo;
+    try { alvo = new URL(href, ORIGEM); } catch (e) { return false; }
+    if (!/^https?:$/.test(alvo.protocol)) return false;
+    return !!alvo.host && alvo.host !== HOSPEDEIRO;
+  }
+
+  function linksExternosEm(no) {
+    const achados = new Set();
+    if (!no) return achados;
+    no.querySelectorAll('a[href]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      if (ehEnderecoExterno(href)) achados.add(new URL(href, ORIGEM).href);
+    });
+    // Endereço escrito no texto, sem virar link.
+    const texto = txt(no) || '';
+    (texto.match(/https?:\/\/[^\s<>"')]+/gi) || []).forEach((u) => {
+      if (ehEnderecoExterno(u)) achados.add(u);
+    });
+    return achados;
+  }
+
+  const temLinkExterno = (item) => linksExternosEm(item).size > 0;
+
+  // Links da seção que não estão dentro de nenhuma atividade (resumo da seção,
+  // por exemplo). As atividades saem do clone porque já foram contadas uma a
+  // uma, e os controles da seção saem para não entrarem como material.
+  function linksExternosSoltos(secao) {
+    const clone = secao.cloneNode(true);
+    clone.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+      .forEach((n) => n.remove());
+    clone.querySelectorAll('.controlmenu, .menu, .dropdown, .action-menu, button, [role="button"], ' +
+      '.sr-only, .accesshide, .visually-hidden, .section_action_menu, .sectionbadges')
+      .forEach((n) => n.remove());
+    return [...linksExternosEm(clone)];
+  }
+
+  // ----------------------------------------------------------------------
+  // A sala tem conteúdo?
+  // ----------------------------------------------------------------------
+  // Devolve { secoes, itens }: "secoes" em zero significa que a página não deu
+  // para ler — diferente de uma sala lida e vazia, que vem com seções e 0 itens.
+  function contaConteudo(doc) {
+    if (!doc) return { secoes: 0, itens: 0 };
+
+    const nos = new Set();
+    doc.querySelectorAll('li.section, li.course-section, [data-for="section"], .course-section').forEach((n) => nos.add(n));
+    const secoes = [...nos].filter((n) => ![...nos].some((o) => o !== n && o.contains(n)));
+
+    let itens = 0;
+    for (const secao of secoes) {
+      const candidatos = new Set();
+      secao.querySelectorAll('li.activity, li.course-module, [data-for="cmitem"], .activity-item')
+        .forEach((n) => candidatos.add(n));
+      const atividades = [...candidatos].filter((n) => ![...candidatos].some((o) => o !== n && o.contains(n)));
+
+      for (const item of atividades) {
+        const classe = item.className || '';
+        const mtipo = (classe.match(/modtype_(\w+)/) || [])[1] || '';
+        const ehRotulo = /modtype_label|\blabel\b/.test(classe);
+        const porLinkExterno = CONFIG.linksExternosContamComoConteudo && ehRotulo && temLinkExterno(item);
+        if (CONFIG.tiposIgnorados.includes(mtipo.toLowerCase())) continue;
+        if (ehRotulo && !CONFIG.rotulosContamComoConteudo && !porLinkExterno) continue;
+        itens++;
+      }
+
+      // Links fora das atividades (resumo da seção) também são material.
+      if (CONFIG.linksExternosContamComoConteudo) itens += linksExternosSoltos(secao).length;
+    }
+    return { secoes: secoes.length, itens };
+  }
+
+  async function leConteudo(curso) {
+    const url = `${ORIGEM}/course/view.php?id=${curso.id}`;
+    const r = await baixaPagina(url);
+    let contagem = contaConteudo(r.doc);
+
+    if (!contagem.secoes && CONFIG.usarIframe) {
+      const doc = await carregaComJs(url, (d) => contaConteudo(d).secoes > 0);
+      if (doc) contagem = contaConteudo(doc);
+    }
+    return contagem;
+  }
+
+  // ----------------------------------------------------------------------
+  // Assistente de backup
+  // ----------------------------------------------------------------------
+  // Os ajustes da primeira etapa que trazem dados de aluno. Desligo todos:
+  // o objetivo é levar só o conteúdo de um semestre para o outro.
+  const AJUSTES_DE_USUARIO = [
+    'setting_root_users',
+    'setting_root_anonymize',
+    'setting_root_role_assignments',
+    'setting_root_userscompletion',
+    'setting_root_logs',
+    'setting_root_grade_histories',
+    'setting_root_comments',
+    'setting_root_badges',
+  ];
+
+  const RE_BOTAO_DE_VOLTA = /cancel|previous|anterior|cancelar/i;
+  const RE_SUCESSO = /(backup (file )?(foi )?(criado|conclu[ií]do|successfully created)|arquivo de backup foi criado)/i;
+  // Quando o site usa backup assíncrono, o Moodle responde na hora e o arquivo
+  // só aparece minutos depois, por uma tarefa agendada.
+  const RE_ASSINCRONO = /(ass[ií]ncron|em segundo plano|in progress|será processad|sera processad|fila de execu)/i;
+
+  function botaoDeAvancar(form) {
+    const botoes = [...form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])')];
+    return botoes.find((b) => !RE_BOTAO_DE_VOLTA.test(b.name || '') && !RE_BOTAO_DE_VOLTA.test(txt(b) || b.value || '')) || null;
+  }
+
+  // O formulário do assistente é o que carrega o id do backup ou a etapa atual;
+  // assim ele não se confunde com o formulário de busca ou o botão "Continuar"
+  // da tela final.
+  function formularioDoAssistente(doc) {
+    if (!doc) return null;
+    return [...doc.querySelectorAll('form')].find((f) =>
+      f.querySelector('input[name="backup"], input[name="stage"]') && botaoDeAvancar(f)) || null;
+  }
+
+  function terminou(doc) {
+    if (!doc || formularioDoAssistente(doc)) return false;
+    const texto = txt(doc.querySelector('#region-main') || doc.body);
+    if (RE_SUCESSO.test(texto)) return true;
+    // Em algumas versões o assistente cai direto na área de restauração.
+    return !!(doc.querySelector('a[href*="restorefile.php"]') || doc.querySelector('a[href*=".mbz"]'));
+  }
+
+  function mensagemDeErro(doc) {
+    if (!doc) return 'resposta vazia do servidor';
+    const erro = [...doc.querySelectorAll('.errorbox, .alert-danger, .invalid-feedback')]
+      .map((e) => txt(e)).filter(Boolean).slice(0, 2).join(' / ');
+    return erro || '';
+  }
+
+  // Serializa o formulário como o navegador faria: preserva os padrões do
+  // Moodle (atividades, blocos, arquivos, banco de questões…) em vez de
+  // reenviar só os campos escondidos, o que desligaria tudo.
+  function dadosDoFormulario(form) {
+    try {
+      const dados = new FormData(form);
+      if ([...dados.keys()].length) return dados;
+    } catch (e) { /* documento do DOMParser: copio campo a campo abaixo */ }
+
+    const dados = new FormData();
+    form.querySelectorAll('input, select, textarea').forEach((campo) => {
+      const tipo = (campo.type || '').toLowerCase();
+      if (!campo.name || campo.disabled) return;
+      if (['submit', 'button', 'reset', 'file', 'image'].includes(tipo)) return;
+      if ((tipo === 'checkbox' || tipo === 'radio') && !campo.checked) return;
+      if (campo.tagName === 'SELECT') {
+        const escolhidas = [...campo.options].filter((o) => o.selected);
+        (escolhidas.length ? escolhidas : campo.options.length ? [campo.options[0]] : [])
+          .forEach((o) => dados.append(campo.name, o.value));
+        return;
+      }
+      dados.append(campo.name, campo.value);
+    });
+    return dados;
+  }
+
+  // Cada ajuste é um checkbox: o Moodle manda junto um campo escondido com 0,
+  // então mandar 0 no lugar do par inteiro é o mesmo que desmarcar na tela.
+  function desligaUsuarios(dados, form) {
+    const desligados = [];
+    for (const nome of AJUSTES_DE_USUARIO) {
+      if (!form.querySelector(`[name="${nome}"]`)) continue;
+      dados.set(nome, '0');
+      desligados.push(nome.replace('setting_root_', ''));
+    }
+    return desligados;
+  }
+
+  // Percorre as etapas do assistente enviando o formulário de cada tela, como
+  // quem clica em "Próximo" até o fim. Só a primeira etapa é alterada.
+  async function fazBackup(curso, anota) {
+    let nomeArquivo = '';
+    const url = `${ORIGEM}/backup/backup.php?id=${curso.id}`;
+    const r = await baixaPagina(url);
+    let doc = r.doc;
+    let urlAtual = r.url || url;
+
+    if (!formularioDoAssistente(doc)) {
+      const erro = mensagemDeErro(doc);
+      if (erro) throw new Error(erro);
+      if (CONFIG.usarIframe) {
+        const comJs = await carregaComJs(url, (d) => !!formularioDoAssistente(d));
+        if (comJs) doc = comJs;
+      }
+    }
+    if (!formularioDoAssistente(doc)) {
+      throw new Error(`não consegui abrir o assistente de backup (HTTP ${r.status})`);
+    }
+
+    for (let etapa = 1; etapa <= CONFIG.maxEtapas; etapa++) {
+      if (terminou(doc)) {
+        return { doc, nomeArquivo, assincrono: RE_ASSINCRONO.test(txt(doc.querySelector('#region-main') || doc.body)) };
+      }
+
+      const form = formularioDoAssistente(doc);
+      if (!form) throw new Error(`o assistente parou na etapa ${etapa} sem como continuar`);
+
+      const dados = dadosDoFormulario(form);
+
+      // A tela de confirmação traz o nome exato do arquivo que será criado —
+      // melhor do que adivinhar depois qual dos .mbz da pasta é o novo.
+      const campoNome = form.querySelector('[name="setting_root_filename"]');
+      if (campoNome && campoNome.value) nomeArquivo = campoNome.value;
+      if (etapa === 1 && CONFIG.semUsuarios) {
+        const desligados = desligaUsuarios(dados, form);
+        if (anota) {
+          anota(desligados.length
+            ? `   sem dados de aluno: ${desligados.join(', ')}`
+            : '   atenção: não achei o ajuste "incluir usuários inscritos" nesta tela');
+        }
+      }
+
+      const botao = botaoDeAvancar(form);
+      if (botao && botao.name) dados.set(botao.name, botao.value || '1');
+
+      const acao = abs(form.getAttribute('action') || urlAtual);
+      const resp = await fetch(acao, { method: 'POST', credentials: 'same-origin', body: dados });
+      const html = await resp.text();
+      urlAtual = resp.url || acao;
+      doc = new DOMParser().parseFromString(html, 'text/html');
+
+      const erro = mensagemDeErro(doc);
+      if (erro) throw new Error(`o Moodle recusou na etapa ${etapa}: ${erro}`);
+    }
+
+    throw new Error('o assistente não chegou ao fim dentro do limite de etapas');
+  }
+
+  // ----------------------------------------------------------------------
+  // O arquivo gerado
+  // ----------------------------------------------------------------------
+  // Melhor esforço: o nome serve para o log e para conferir que o arquivo
+  // existe. Para restaurar em 26.2, ele já está na área de backup do curso.
+  function procuraLink(doc, nomeArquivo) {
+    if (!doc) return null;
+    const links = [...doc.querySelectorAll('a[href*=".mbz"]')];
+    if (!links.length) return null;
+    // Com o nome vindo do assistente, pego o arquivo certo mesmo que a área de
+    // backup do curso já tenha outros.
+    if (nomeArquivo) {
+      const exato = links.find((a) => (a.getAttribute('href') || '').includes(nomeArquivo) || txt(a) === nomeArquivo);
+      if (exato) return exato;
+      return null;
+    }
+    return links[0];
+  }
+
+  async function achaArquivoGerado(docFinal, courseid, nomeArquivo) {
+    const paraRestauracao = docFinal ? docFinal.querySelector('a[href*="restorefile.php"]') : null;
+    const paginaDeRestauracao = paraRestauracao
+      ? abs(paraRestauracao.getAttribute('href'))
+      : `${ORIGEM}/backup/restorefile.php?courseid=${courseid}`;
+
+    let link = procuraLink(docFinal, nomeArquivo);
+    if (!link) {
+      const r = await baixaPagina(paginaDeRestauracao);
+      link = procuraLink(r.doc, nomeArquivo);
+    }
+    if (!link) return { href: '', nome: nomeArquivo || '', paginaDeRestauracao };
+
+    const href = abs(link.getAttribute('href'));
+    const nome = txt(link) || decodeURIComponent(href.split('/').pop().split('?')[0]);
+    return { href, nome, paginaDeRestauracao };
+  }
+
+  // Baixa pelo próprio link, em vez de puxar o arquivo inteiro para a memória
+  // e montar um blob: o .mbz de uma sala pode ter centenas de MB, e assim o
+  // navegador grava em disco enquanto baixa. O cookie da sessão vai junto
+  // porque é o mesmo site.
+  async function baixaArquivo(arquivo, nomeParaSalvar) {
+    const url = new URL(arquivo.href);
+    url.searchParams.set('forcedownload', '1');
+
+    // Confiro antes de anunciar: se vier a tela de login, um 403 ou uma página
+    // de erro, é melhor dizer isso do que garantir um download que não houve.
+    let detalhe = '';
+    try {
+      const resp = await fetch(url.href, { method: 'HEAD', credentials: 'same-origin' });
+      if (resp.status === 403 || resp.status === 404) throw new Error(`o servidor respondeu HTTP ${resp.status}`);
+      if (/text\/html/i.test(resp.headers.get('content-type') || '')) {
+        throw new Error('o link devolveu uma página, não o arquivo');
+      }
+      const tamanho = Number(resp.headers.get('content-length') || 0);
+      if (tamanho) detalhe = ` (${(tamanho / 1048576).toFixed(1)} MB)`;
+    } catch (e) {
+      // Servidor que recusa HEAD não é motivo para desistir do download.
+      if (/HTTP |página/.test(e.message)) throw e;
+    }
+
+    const a = document.createElement('a');
+    a.href = url.href;
+    a.download = nomeParaSalvar || arquivo.nome;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return detalhe;
+  }
+
+  // O navegador trata download em rajada como abuso: o primeiro passa e os
+  // demais são bloqueados sem aviso nenhum na página.
+  let avisouSobreDownloads = false;
+  function avisaSobreVariosDownloads() {
+    if (avisouSobreDownloads) return;
+    avisouSobreDownloads = true;
+    log('   (se o navegador perguntar se este site pode baixar vários arquivos, responda que sim —', 'aviso');
+    log('    sem isso ele bloqueia do segundo em diante em silêncio)', 'aviso');
+  }
+
+  // ----------------------------------------------------------------------
+  // Confirmação por sala
+  // ----------------------------------------------------------------------
+  let perguntarSempre = true;
+
+  function confirmaSala(curso, contagem, indice, total) {
+    return new Promise((resolve) => {
+      const fundo = document.createElement('div');
+      fundo.style.cssText = `position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);
+        display:flex;align-items:center;justify-content:center;font:13px/1.5 system-ui,sans-serif;`;
+
+      const caixa = document.createElement('div');
+      caixa.style.cssText = `background:#fff;border-radius:10px;padding:18px 20px;width:min(500px,92vw);
+        box-shadow:0 12px 40px rgba(0,0,0,.3);`;
+
+      caixa.innerHTML = `
+        <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#667;">Sala ${indice} de ${total}</div>
+        <div style="font-size:15px;font-weight:600;margin:4px 0 10px;">${nomeCurto(curso.nome)}</div>
+        <div style="color:#333;">Conteúdo encontrado: <strong>${contagem.itens} item(ns)</strong> em ${contagem.secoes} seção(ões).</div>
+        <div style="background:#eef3ff;border:1px solid #c9d8f5;border-radius:6px;padding:8px;color:#22407e;margin:10px 0 12px;">
+          O backup vai <strong>sem os usuários inscritos</strong> — só o conteúdo.
+          Ele roda no servidor e pode demorar; deixe a aba aberta.
+        </div>
+        <label style="display:flex;gap:6px;align-items:center;color:#555;margin-bottom:14px;">
+          <input type="checkbox" id="ugb-nao-perguntar"> Fazer as próximas sem perguntar
+        </label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="ugb-parar" style="padding:8px 12px;border:0;border-radius:5px;background:#b3261e;color:#fff;cursor:pointer;">Parar tudo</button>
+          <button id="ugb-pular" style="padding:8px 12px;border:1px solid #ccd;border-radius:5px;background:#fff;color:#333;cursor:pointer;">Pular esta</button>
+          <button id="ugb-fazer" style="padding:8px 12px;border:0;border-radius:5px;background:#28a745;color:#fff;cursor:pointer;">Fazer backup</button>
+        </div>`;
+
+      fundo.appendChild(caixa);
+      document.body.appendChild(fundo);
+      caixa.querySelector('#ugb-fazer').focus();
+
+      const responde = (r) => {
+        if (r === 'fazer' && caixa.querySelector('#ugb-nao-perguntar').checked) perguntarSempre = false;
+        document.removeEventListener('keydown', tecla);
+        fundo.remove();
+        resolve(r);
+      };
+      const tecla = (e) => { if (e.key === 'Escape') responde('pular'); };
+
+      caixa.querySelector('#ugb-fazer').onclick = () => responde('fazer');
+      caixa.querySelector('#ugb-pular').onclick = () => responde('pular');
+      caixa.querySelector('#ugb-parar').onclick = () => responde('parar');
+      fundo.onclick = (e) => { if (e.target === fundo) responde('pular'); };
+      document.addEventListener('keydown', tecla);
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Execução
+  // ----------------------------------------------------------------------
+  let rodando = false, interromper = false;
+  let relatorio = [];
+
+  async function executar(somenteConferir) {
+    if (rodando) return;
+    rodando = true; interromper = false; perguntarSempre = true; relatorio = [];
+    travaBotoes(true); botaoParar.style.display = ''; botaoCopiar.style.display = 'none';
+    painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} salas nesta categoria.`);
+      if (!somenteConferir) log('Vou confirmar sala por sala antes de fazer o backup.');
+
+      for (let i = 0; i < cursos.length; i++) {
+        const curso = cursos[i];
+        if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+
+        const curto = nomeCurto(curso.nome);
+        const registro = { curso, curto, estado: 'pendente', itens: 0, observacao: '' };
+        relatorio.push(registro);
+        log(`— ${curto}`);
+
+        try {
+          const contagem = await leConteudo(curso);
+          registro.itens = contagem.itens;
+
+          if (!contagem.secoes) {
+            registro.estado = 'não conferida';
+            registro.observacao = 'não consegui ler a página da sala';
+            log('   pulada: não consegui ler a página da sala para conferir o conteúdo', 'erro');
+            continue;
+          }
+          if (!contagem.itens && CONFIG.pularSalasSemConteudo) {
+            registro.estado = 'sem conteúdo';
+            registro.observacao = `${contagem.secoes} seção(ões), nenhum item`;
+            log(`   pulada: sala sem conteúdo (${contagem.secoes} seção(ões), nenhum item)`, 'aviso');
+            continue;
+          }
+          log(`   conteúdo: ${contagem.itens} item(ns) em ${contagem.secoes} seção(ões)`);
+
+          if (somenteConferir) {
+            registro.estado = 'faria backup';
+            continue;
+          }
+
+          const resposta = perguntarSempre
+            ? await confirmaSala(curso, contagem, i + 1, cursos.length)
+            : 'fazer';
+          if (resposta === 'parar') { registro.estado = 'pulada'; log('Interrompido por você.', 'aviso'); break; }
+          if (resposta === 'pular') { registro.estado = 'pulada'; log('   pulada por você', 'aviso'); continue; }
+
+          const resultado = await fazBackup(curso, (m) => log(m));
+          const arquivo = await achaArquivoGerado(resultado.doc, curso.id, resultado.nomeArquivo);
+
+          registro.estado = 'backup feito';
+          registro.observacao = arquivo.nome || 'arquivo na área de backup do curso';
+          log(`   backup gerado na área de backup da sala${arquivo.nome ? `: ${arquivo.nome}` : ''}`, 'ok');
+
+          if (resultado.assincrono) {
+            registro.observacao += ' (em segundo plano)';
+            log('   o site faz backup assíncrono: o arquivo aparece na área de backup em alguns minutos', 'aviso');
+          }
+
+          if (CONFIG.baixarArquivo && arquivo.href) {
+            // O backup já existe na sala: se só o download falhar, isso não
+            // pode derrubar a sala inteira para a lista de erros.
+            try {
+              // Salvo com o nome da sala, e não com o nome que o Moodle dá
+              // (backup-moodle2-course-123-abreviatura-…): é por esse nome que
+              // o script de restauração casa o arquivo com a sala do semestre
+              // novo.
+              const nomeParaSalvar = `${limpaNome(curso.nome)}.mbz`;
+              const detalhe = await baixaArquivo(arquivo, nomeParaSalvar);
+              log(`   download iniciado: ${nomeParaSalvar}${detalhe}`, 'ok');
+              avisaSobreVariosDownloads();
+              await dorme(CONFIG.pausaEntreDownloadsMs);
+            } catch (e) {
+              registro.observacao += ` — download falhou: ${e.message}`;
+              log(`   download falhou: ${e.message}`, 'erro');
+              log(`   o backup continua na sala; baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
+            }
+          } else if (CONFIG.baixarArquivo) {
+            registro.observacao += ' — sem link para download';
+            log(`   não achei o link do arquivo. Baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
+          }
+        } catch (e) {
+          registro.estado = 'erro';
+          registro.observacao = e.message;
+          log(`   erro: ${e.message}`, 'erro');
+        }
+        await dorme(CONFIG.pausaMs);
+      }
+
+      resumoFinal();
+      if (relatorio.length) botaoCopiar.style.display = '';
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false; perguntarSempre = true;
+      travaBotoes(false); botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // Resumo
+  // ----------------------------------------------------------------------
+  const ESTADOS = [
+    ['backup feito', 'BACKUPS FEITOS'],
+    ['faria backup', 'SALAS COM CONTEÚDO (só conferido)'],
+    ['sem conteúdo', 'PULADAS POR NÃO TER CONTEÚDO'],
+    ['não conferida', 'PULADAS POR NÃO CONSEGUIR LER A SALA'],
+    ['pulada', 'PULADAS POR VOCÊ'],
+    ['erro', 'COM ERRO'],
+  ];
+
+  function textoResumo() {
+    const linhas = [`BACKUP DAS SALAS — ${new Date().toLocaleString('pt-BR')}`];
+    linhas.push(`${relatorio.length} sala(s) percorrida(s).`);
+
+    for (const [estado, titulo] of ESTADOS) {
+      const itens = relatorio.filter((r) => r.estado === estado);
+      if (!itens.length) continue;
+      linhas.push('');
+      linhas.push(`${titulo} (${itens.length})`);
+      for (const r of itens) {
+        const detalhe = r.observacao ? ` — ${r.observacao}` : '';
+        linhas.push(`  - ${r.curto}${detalhe}`);
+      }
+    }
+    return linhas.join('\n');
+  }
+
+  function resumoFinal() {
+    log('');
+    log('════════ RESUMO ════════');
+    for (const linha of textoResumo().split('\n')) {
+      const tipo = /^BACKUPS FEITOS/.test(linha) ? 'ok'
+        : (/^(PULADAS|COM ERRO)/.test(linha) ? 'aviso' : undefined);
+      log(linha, tipo);
+    }
+  }
+
+  function copiarResumo() {
+    if (!relatorio.length) { log('Rode o backup antes de copiar o resumo.', 'aviso'); return; }
+    navigator.clipboard.writeText(textoResumo())
+      .then(() => log('Resumo copiado para a área de transferência.', 'ok'))
+      .catch(() => log('Não consegui copiar automaticamente — selecione o texto no painel.', 'aviso'));
+  }
+
+  // ----------------------------------------------------------------------
+  // Painel
+  // ----------------------------------------------------------------------
+  const painel = document.createElement('div');
+  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;width:400px;
+    font:12px/1.45 system-ui,sans-serif;background:#fff;border:1px solid #ccd;border-radius:8px;
+    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
+
+  const titulo = document.createElement('div');
+  titulo.textContent = 'Fazer backup das salas (sem alunos)';
+  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
+
+  const botoes = document.createElement('div');
+  botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+
+  const criaBotao = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoes.appendChild(b);
+    return b;
+  };
+
+  const botao = criaBotao('Fazer backup', '#28a745', () => executar(false));
+  const botaoConferir = criaBotao('Só conferir', '#5a6673', () => executar(true));
+  const botaoCopiar = criaBotao('Copiar resumo', '#5b21b6', copiarResumo);
+  botaoCopiar.style.display = 'none';
+  const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
+  botaoParar.style.display = 'none';
+
+  const travaBotoes = (t) => {
+    botao.disabled = botaoConferir.disabled = t;
+    botaoCopiar.disabled = t;
+  };
+
+  const painelLog = document.createElement('div');
+  painelLog.style.cssText = 'margin-top:8px;max-height:340px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+
+  painel.append(titulo, botoes, painelLog);
+  document.body.appendChild(painel);
+
+  function log(msg, tipo) {
+    const cor = { ok: '#177245', erro: '#b3261e', aviso: '#8a6100' }[tipo] || '#333';
+    const linha = document.createElement('div');
+    linha.style.color = cor;
+    linha.style.fontWeight = tipo ? '600' : 'normal';
+    linha.textContent = msg;
+    painelLog.appendChild(linha);
+    painelLog.scrollTop = painelLog.scrollHeight;
+    console.log('[UGB backup]', msg);
+  }
+})();
