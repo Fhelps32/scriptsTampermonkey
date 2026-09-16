@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Conferir material de apoio das salas (NEAD)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.1
-// @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias e quem é o professor de cada uma.
+// @version      2.2
+// @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias, quem é o professor de cada uma — e agora também detecta e corrige tópicos/atividades ocultos dos estudantes.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @icon         https://nead.ugb.edu.br/favicon.ico
@@ -44,6 +44,24 @@
     pausaMs: 600,
     usarIframe: true,                 // fallback quando a página do curso é montada por JS
     esperaIframeMs: 12000,
+
+    // --- Conteúdo oculto (tópicos/atividades/recursos) ---------------------
+    // Liga/desliga a nova checagem de visibilidade real do Moodle. Com false,
+    // o script volta a se comportar exatamente como antes (nenhuma chamada
+    // nova é feita).
+    verificarOcultos: true,
+    // true  = tenta tornar visível automaticamente o que estiver oculto.
+    // false = só relata o que está oculto, sem alterar nada (modo "só relatório").
+    // Também dá pra ligar/desligar isso pelo painel, na caixa de seleção.
+    corrigirOcultos: true,
+    // Pausa entre cada chamada de "tornar visível", pra não sobrecarregar o
+    // servidor quando uma sala tiver muitos itens ocultos de uma vez.
+    pausaAjaxMs: 350,
+    // Mostra no console do navegador (F12) o estado bruto devolvido pelo
+    // Moodle para a primeira sala processada — só pra conferir se os nomes de
+    // campo usados aqui (visible, title, name…) batem com a sua instância,
+    // caso algo pareça estranho no relatório.
+    debugOcultos: true,
   };
 
   const ORIGEM = location.origin;
@@ -110,6 +128,132 @@
         }
       }, 400);
     });
+  }
+
+  // ----------------------------------------------------------------------
+  // Visibilidade real (API do editor de cursos do Moodle)
+  // ----------------------------------------------------------------------
+  // Este bloco NÃO usa a mesma técnica do resto do script (ler o HTML da
+  // página). Em vez disso, chama o mesmo endpoint AJAX que o editor de
+  // cursos do Moodle usa para ler e alterar o estado real de seções e
+  // atividades: o campo "visible" que vem daqui é o dado do banco
+  // (course_sections.visible / course_modules.visible), não uma classe CSS.
+
+  function pegaSesskey() {
+    try {
+      if (window.M && M.cfg && M.cfg.sesskey) return M.cfg.sesskey;
+    } catch (e) { /* ignora */ }
+    return null;
+  }
+
+  let _debugOcultosMostrado = false;
+
+  // Chama o endpoint interno de AJAX do Moodle (lib/ajax/service.php) — o
+  // mesmo que o editor de cursos usa. Autenticado pela sessão do navegador
+  // (cookie enviado via credentials:'same-origin') e protegido por
+  // "sesskey", o token anti-CSRF do Moodle.
+  async function chamadaAjax(metodo, args) {
+    const sesskey = pegaSesskey();
+    if (!sesskey) throw new Error('sesskey não encontrado (M.cfg.sesskey ausente nesta página)');
+    const url = `${ORIGEM}/lib/ajax/service.php?sesskey=${encodeURIComponent(sesskey)}&info=${encodeURIComponent(metodo)}`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ index: 0, methodname: metodo, args }]),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ao chamar ${metodo}`);
+    const payload = await resp.json();
+    const item = Array.isArray(payload) ? payload[0] : null;
+    if (!item) throw new Error(`resposta inesperada do servidor para ${metodo}`);
+    if (item.error) {
+      const msg = (item.exception && (item.exception.message || item.exception.errorcode)) || 'erro desconhecido';
+      throw new Error(msg);
+    }
+    // O Moodle devolve o estado do curso como uma string JSON dentro de "data".
+    return typeof item.data === 'string' ? JSON.parse(item.data) : item.data;
+  }
+
+  const ehFalso = (v) => v === false || v === 0 || v === '0';
+
+  async function pegaEstadoCurso(courseid) {
+    return chamadaAjax('core_courseformat_get_state', { courseid: Number(courseid) });
+  }
+
+  // acao: 'section_show' ou 'cm_show' (existem também 'section_hide' /
+  // 'cm_hide', mas não são usadas aqui — o objetivo é só tornar visível).
+  async function alteraVisibilidade(courseid, acao, id) {
+    return chamadaAjax('core_courseformat_update_course', {
+      action: acao, courseid: Number(courseid), ids: [Number(id)],
+    });
+  }
+
+  function nomeEstadoSecao(s) {
+    return s.title || s.name || `Seção nº ${s.number ?? s.id}`;
+  }
+  function nomeEstadoCm(c) {
+    return c.name || `Item #${c.id}`;
+  }
+
+  // Lê o estado real do curso, identifica seções e atividades/recursos
+  // marcados como ocultos (campo "visible", vindo do banco — não do HTML) e,
+  // se CONFIG.corrigirOcultos estiver ligado, tenta tornar cada um visível.
+  //
+  // Seções ocultas são corrigidas primeiro: quando uma seção está oculta, os
+  // itens dentro dela ficam indisponíveis para os estudantes mesmo que o
+  // "visible" de cada item, individualmente, já esteja 1 — então só faz
+  // sentido tentar mostrar um item cujo PRÓPRIO estado está oculto (os que só
+  // estão "escondidos" por causa da seção voltam a aparecer sozinhos quando a
+  // seção é mostrada, sem precisar mexer neles).
+  async function verificaEAjustaOcultos(curso) {
+    const resultado = { verificados: 0, ocultosEncontrados: [], alterados: [], falhas: [] };
+
+    let estado;
+    try {
+      estado = await pegaEstadoCurso(curso.id);
+    } catch (e) {
+      resultado.falhas.push(`Não foi possível ler o estado real do curso: ${e.message}`);
+      return resultado;
+    }
+
+    if (CONFIG.debugOcultos && !_debugOcultosMostrado) {
+      _debugOcultosMostrado = true;
+      console.log('[NEAD] Estado bruto devolvido pelo Moodle (1ª sala, para conferência):', estado);
+    }
+
+    const secoes = (estado && estado.section) || [];
+    const cms = (estado && estado.cm) || [];
+    resultado.verificados = secoes.length + cms.length;
+
+    const secoesOcultas = secoes.filter((s) => ehFalso(s.visible));
+    const cmsOcultos = cms.filter((c) => ehFalso(c.visible));
+
+    secoesOcultas.forEach((s) => resultado.ocultosEncontrados.push({ tipo: 'Tópico/seção', nome: nomeEstadoSecao(s) }));
+    cmsOcultos.forEach((c) => resultado.ocultosEncontrados.push({ tipo: 'Atividade/recurso', nome: nomeEstadoCm(c) }));
+
+    if (!CONFIG.corrigirOcultos) return resultado;
+
+    for (const s of secoesOcultas) {
+      try {
+        await alteraVisibilidade(curso.id, 'section_show', s.id);
+        resultado.alterados.push({ tipo: 'Tópico/seção', nome: nomeEstadoSecao(s) });
+      } catch (e) {
+        resultado.falhas.push(`Seção "${nomeEstadoSecao(s)}": ${e.message}`);
+      }
+      await dorme(CONFIG.pausaAjaxMs);
+    }
+
+    for (const c of cmsOcultos) {
+      try {
+        await alteraVisibilidade(curso.id, 'cm_show', c.id);
+        resultado.alterados.push({ tipo: 'Atividade/recurso', nome: nomeEstadoCm(c) });
+      } catch (e) {
+        resultado.falhas.push(`"${nomeEstadoCm(c)}": ${e.message}`);
+      }
+      await dorme(CONFIG.pausaAjaxMs);
+    }
+
+    return resultado;
   }
 
   // ----------------------------------------------------------------------
@@ -493,6 +637,22 @@
     return vistos ? `sem professor atribuído (papéis na sala: ${vistos})` : 'sem professor atribuído';
   }
 
+  // Resume o resultado da checagem de conteúdo oculto de uma sala, pra uso
+  // direto no log linha-a-linha.
+  function linhaOcultos(o) {
+    if (!o) return '';
+    if (o.falhas.length && !o.ocultosEncontrados.length) {
+      return `Conteúdo oculto: não foi possível verificar (${o.falhas[0]})`;
+    }
+    if (!o.ocultosEncontrados.length) return 'Conteúdo oculto: nenhum encontrado.';
+    const detalhe = o.ocultosEncontrados.map((x) => `${x.tipo}: ${x.nome}`).join(' · ');
+    if (!CONFIG.corrigirOcultos) {
+      return `Conteúdo oculto encontrado (${o.ocultosEncontrados.length}, não corrigido — modo relatório): ${detalhe}`;
+    }
+    const falhaTxt = o.falhas.length ? ` — falhas: ${o.falhas.join(' | ')}` : '';
+    return `Conteúdo oculto encontrado (${o.ocultosEncontrados.length}), tornado visível (${o.alterados.length}): ${detalhe}${falhaTxt}`;
+  }
+
   async function leCurso(curso) {
     const url = `${ORIGEM}/course/view.php?id=${curso.id}`;
     const r = await baixaPagina(url);
@@ -507,9 +667,13 @@
       ? await listaProfessores(curso.id)
       : { nomes: [], papeisVistos: [], lido: false };
 
+    const ocultos = CONFIG.verificarOcultos
+      ? await verificaEAjustaOcultos(curso)
+      : null;
+
     const ignoradas = brutas.filter((s) => ehSecaoIgnorada(s.nome));
     const secoes = brutas.filter((s) => !ehSecaoIgnorada(s.nome));
-    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome), professores };
+    return { url, status: r.status, secoes, totalBruto: brutas.length, ignoradas: ignoradas.map((s) => s.nome), professores, ocultos };
   }
 
   // ----------------------------------------------------------------------
@@ -542,6 +706,7 @@
       curso, url: leitura.url, secoes, estado, seguePadrao,
       ignoradas: leitura.ignoradas || [],
       professores: leitura.professores || { nomes: [], lido: false },
+      ocultos: leitura.ocultos || null,
     };
   }
 
@@ -575,6 +740,13 @@
 
           if (CONFIG.mostrarProfessores) log(`   Professor(es): ${textoProfessores(r)}`);
 
+          if (CONFIG.verificarOcultos && r.ocultos) {
+            const tipoOcultos = r.ocultos.falhas.length
+              ? 'erro'
+              : (r.ocultos.ocultosEncontrados.length ? 'aviso' : undefined);
+            log(`   ${linhaOcultos(r.ocultos)}`, tipoOcultos);
+          }
+
           if (r.ignoradas.length) log(`   (ignorando: ${r.ignoradas.join(' | ')})`);
 
           if (r.secoes.length) {
@@ -600,6 +772,7 @@
           relatorio.push({
             curso, url: `${ORIGEM}/course/view.php?id=${curso.id}`, estado: 'erro',
             secoes: [], seguePadrao: false, professores: { nomes: [], papeisVistos: [], lido: false },
+            ocultos: null,
           });
         }
         await dorme(CONFIG.pausaMs);
@@ -632,6 +805,29 @@
       .map((s) => `      · ${s.nome}: ${formataTipos(s.tiposConteudo)}`);
   }
 
+  // Bloco final do resumo com o total de conteúdo oculto encontrado/corrigido
+  // em todas as salas, e a lista de salas que precisam de atenção manual
+  // (erro de permissão, item que o Moodle recusou alterar etc.).
+  function linhasResumoOcultos() {
+    let encontrados = 0, corrigidos = 0;
+    const comFalha = [];
+    relatorio.forEach((r) => {
+      if (!r.ocultos) return;
+      encontrados += r.ocultos.ocultosEncontrados.length;
+      corrigidos += r.ocultos.alterados.length;
+      if (r.ocultos.falhas.length) comFalha.push({ nome: nomeCurto(r.curso), falhas: r.ocultos.falhas });
+    });
+    const linhas = [''];
+    linhas.push(CONFIG.corrigirOcultos
+      ? `CONTEÚDO OCULTO — ${encontrados} encontrado(s), ${corrigidos} tornado(s) visível`
+      : `CONTEÚDO OCULTO — ${encontrados} encontrado(s) (modo relatório: nada foi alterado)`);
+    if (comFalha.length) {
+      linhas.push(`  precisam de atenção manual (${comFalha.length} sala(s)):`);
+      comFalha.forEach((c) => linhas.push(`    - ${c.nome}: ${c.falhas.join(' | ')}`));
+    }
+    return linhas;
+  }
+
   function textoResumo() {
     const comConteudo = relatorio.filter((r) => r.estado === 'com conteúdo');
     const semConteudo = relatorio.filter((r) => r.estado === 'sem conteúdo');
@@ -658,6 +854,9 @@
       linhas.push(`NÃO FOI POSSÍVEL VERIFICAR (${ilegiveis.length})`);
       ilegiveis.forEach((r) => linhas.push(linhaSala('  ', r)));
     }
+
+    if (CONFIG.verificarOcultos) linhas.push(...linhasResumoOcultos());
+
     return linhas.join('\n');
   }
 
@@ -707,6 +906,24 @@
     try { localStorage.setItem(CHAVE_LS, areaIgnoradas.value); } catch (e) { /* ignora */ }
   });
 
+  // Caixa de seleção para ligar/desligar a correção automática de conteúdo
+  // oculto sem precisar editar o código. Desmarcada, o script passa a só
+  // relatar o que está oculto (modo "dry run" — nada é alterado no Moodle).
+  const CHAVE_LS_CORRIGIR = 'ugbAuditoriaCorrigirOcultos';
+  const linhaCorrigir = document.createElement('label');
+  linhaCorrigir.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:8px;color:#334;cursor:pointer;';
+  const checkCorrigir = document.createElement('input');
+  checkCorrigir.type = 'checkbox';
+  let valorCorrigirSalvo = null;
+  try { valorCorrigirSalvo = localStorage.getItem(CHAVE_LS_CORRIGIR); } catch (e) { /* ignora */ }
+  checkCorrigir.checked = valorCorrigirSalvo === null ? CONFIG.corrigirOcultos : valorCorrigirSalvo === '1';
+  CONFIG.corrigirOcultos = checkCorrigir.checked;
+  checkCorrigir.addEventListener('change', () => {
+    CONFIG.corrigirOcultos = checkCorrigir.checked;
+    try { localStorage.setItem(CHAVE_LS_CORRIGIR, checkCorrigir.checked ? '1' : '0'); } catch (e) { /* ignora */ }
+  });
+  linhaCorrigir.append(checkCorrigir, document.createTextNode(' Corrigir automaticamente conteúdo oculto (desmarque para só relatar, sem alterar nada)'));
+
   const botoes = document.createElement('div');
   botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
 
@@ -730,7 +947,7 @@
   const painelLog = document.createElement('div');
   painelLog.style.cssText = 'margin-top:8px;max-height:380px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
 
-  painel.append(titulo, labelIgnoradas, areaIgnoradas, botoes, painelLog);
+  painel.append(titulo, labelIgnoradas, areaIgnoradas, linhaCorrigir, botoes, painelLog);
   document.body.appendChild(painel);
 
   function log(msg, tipo) {
