@@ -22,6 +22,8 @@
     semUsuarios: true,          // desmarca "incluir usuários inscritos" e o resto dos dados de aluno
     baixarArquivo: true,        // baixar o .mbz para o computador, além de gerar na sala
     pausaEntreDownloadsMs: 1500, // respiro entre downloads: em rajada o navegador bloqueia
+    tentativasArquivo: 3,       // o arquivo às vezes demora a aparecer na lista
+    pausaTentativaArquivoMs: 4000,
     maxEtapas: 8,               // trava: o assistente do Moodle tem 4 etapas, 8 é folga
 
     // Conteúdo da sala — mesmas regras do script "Conferir material de apoio".
@@ -360,30 +362,60 @@
   // ----------------------------------------------------------------------
   // Melhor esforço: o nome serve para o log e para conferir que o arquivo
   // existe. Para restaurar em 26.2, ele já está na área de backup do curso.
-  function procuraLink(doc, nomeArquivo) {
-    if (!doc) return null;
-    const links = [...doc.querySelectorAll('a[href*=".mbz"]')];
-    if (!links.length) return null;
-    // Com o nome vindo do assistente, pego o arquivo certo mesmo que a área de
-    // backup do curso já tenha outros.
-    if (nomeArquivo) {
-      const exato = links.find((a) => (a.getAttribute('href') || '').includes(nomeArquivo) || txt(a) === nomeArquivo);
-      if (exato) return exato;
-      return null;
-    }
-    return links[0];
+  // O nome do arquivo vem codificado dentro do endereço
+  // (…course-1079-%5B26.1%5D%5Badp-dep%5D_topografia…), então comparar com o
+  // nome cru nunca casa. Decodifico antes de comparar.
+  function nomeDoHref(href) {
+    const ultimo = (href || '').split('/').pop().split('?')[0];
+    try { return decodeURIComponent(ultimo); } catch (e) { return ultimo; }
   }
 
-  async function achaArquivoGerado(docFinal, courseid, nomeArquivo) {
-    const paraRestauracao = docFinal ? docFinal.querySelector('a[href*="restorefile.php"]') : null;
-    const paginaDeRestauracao = paraRestauracao
-      ? abs(paraRestauracao.getAttribute('href'))
-      : `${ORIGEM}/backup/restorefile.php?courseid=${courseid}`;
+  // Nunca chuto um arquivo. Ou é o nome que o assistente mostrou, ou é um
+  // arquivo que o próprio Moodle nomeou com o id desta sala.
+  //
+  // Antes, quando nada casava, esta função devolvia o primeiro .mbz da lista —
+  // e aí o script baixava o backup de outra matéria com o nome desta. Pior
+  // quando os backups vão para a área privada do usuário: a lista é a mesma
+  // para todas as salas, e o primeiro item é sempre o mesmo arquivo.
+  function procuraLink(doc, nomeArquivo, courseid, jaBaixados) {
+    if (!doc) return null;
+    const links = [...doc.querySelectorAll('a[href*=".mbz"]')]
+      .filter((a) => !jaBaixados || !jaBaixados.has(abs(a.getAttribute('href') || '')));
+    if (!links.length) return null;
 
-    let link = procuraLink(docFinal, nomeArquivo);
-    if (!link) {
+    if (nomeArquivo) {
+      const exato = links.find((a) =>
+        nomeDoHref(a.getAttribute('href') || '') === nomeArquivo || txt(a) === nomeArquivo);
+      if (exato) return exato;
+    }
+
+    // Nome padrão do Moodle: backup-moodle2-course-<id do curso>-…
+    const marca = `-course-${courseid}-`;
+    return links.find((a) => nomeDoHref(a.getAttribute('href') || '').includes(marca) || txt(a).includes(marca)) || null;
+  }
+
+  // A área de backup pede o id de contexto. Quando a tela final não traz o
+  // link, busco na página da própria sala antes de tentar pelo id do curso.
+  async function enderecoDaAreaDeBackup(docFinal, courseid) {
+    const naTelaFinal = docFinal ? docFinal.querySelector('a[href*="restorefile.php"]') : null;
+    if (naTelaFinal) return abs(naTelaFinal.getAttribute('href'));
+
+    const r = await baixaPagina(`${ORIGEM}/course/view.php?id=${courseid}`);
+    const naSala = r.doc ? r.doc.querySelector('a[href*="restorefile.php"]') : null;
+    if (naSala) return abs(naSala.getAttribute('href'));
+
+    return `${ORIGEM}/backup/restorefile.php?courseid=${courseid}`;
+  }
+
+  async function achaArquivoGerado(docFinal, courseid, nomeArquivo, jaBaixados) {
+    const paginaDeRestauracao = await enderecoDaAreaDeBackup(docFinal, courseid);
+
+    let link = procuraLink(docFinal, nomeArquivo, courseid, jaBaixados);
+    // O arquivo às vezes ainda não está na lista quando a tela final aparece.
+    for (let tentativa = 1; !link && tentativa <= CONFIG.tentativasArquivo; tentativa++) {
+      if (tentativa > 1) await dorme(CONFIG.pausaTentativaArquivoMs);
       const r = await baixaPagina(paginaDeRestauracao);
-      link = procuraLink(r.doc, nomeArquivo);
+      link = procuraLink(r.doc, nomeArquivo, courseid, jaBaixados);
     }
     if (!link) return { href: '', nome: nomeArquivo || '', paginaDeRestauracao };
 
@@ -497,6 +529,8 @@
   async function executar(somenteConferir) {
     if (rodando) return;
     rodando = true; interromper = false; perguntarSempre = true; relatorio = [];
+    // Um mesmo arquivo não pode ser baixado para duas salas diferentes.
+    const arquivosBaixados = new Set();
     travaBotoes(true); botaoParar.style.display = ''; botaoCopiar.style.display = 'none';
     painelLog.innerHTML = '';
 
@@ -544,7 +578,7 @@
           if (resposta === 'pular') { registro.estado = 'pulada'; log('   pulada por você', 'aviso'); continue; }
 
           const resultado = await fazBackup(curso, (m) => log(m));
-          const arquivo = await achaArquivoGerado(resultado.doc, curso.id, resultado.nomeArquivo);
+          const arquivo = await achaArquivoGerado(resultado.doc, curso.id, resultado.nomeArquivo, arquivosBaixados);
 
           registro.estado = 'backup feito';
           registro.observacao = arquivo.nome || 'arquivo na área de backup do curso';
@@ -565,6 +599,7 @@
               // novo.
               const nomeParaSalvar = `${limpaNome(curso.nome)}.mbz`;
               const detalhe = await baixaArquivo(arquivo, nomeParaSalvar);
+              arquivosBaixados.add(arquivo.href);
               log(`   download iniciado: ${nomeParaSalvar}${detalhe}`, 'ok');
               avisaSobreVariosDownloads();
               await dorme(CONFIG.pausaEntreDownloadsMs);
@@ -575,7 +610,8 @@
             }
           } else if (CONFIG.baixarArquivo) {
             registro.observacao += ' — sem link para download';
-            log(`   não achei o link do arquivo. Baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
+            log(`   não achei o arquivo desta sala${arquivo.nome ? ` (${arquivo.nome})` : ''} na área de backup.`, 'aviso');
+            log(`   não baixei nada para não pegar o backup de outra matéria. Baixe por ${arquivo.paginaDeRestauracao}`, 'aviso');
           }
         } catch (e) {
           registro.estado = 'erro';
