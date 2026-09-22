@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Conferir material de apoio das salas (NEAD)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.2
-// @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias, quem é o professor de cada uma — e agora também detecta e corrige tópicos/atividades ocultos dos estudantes.
+// @version      2.3
+// @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias, quem é o professor de cada uma, detecta e corrige tópicos/atividades ocultos dos estudantes — e, dentro de Adaptação/Dependência, põe uma imagem numa seção nova no topo de todas as salas de um curso.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
 // @icon         https://nead.ugb.edu.br/favicon.ico
@@ -62,6 +62,26 @@
     // campo usados aqui (visible, title, name…) batem com a sua instância,
     // caso algo pareça estranho no relatório.
     debugOcultos: true,
+  };
+
+  // ----------------------------------------------------------------------
+  // Ajustes da funcionalidade "imagem no topo das salas"
+  // ----------------------------------------------------------------------
+  // Propositalmente separado do CONFIG acima: nada aqui interfere na
+  // conferência de material de apoio.
+  const CONFIG_IMAGEM = {
+    // A funcionalidade só se habilita quando a categoria aberta é esta ou
+    // está dentro dela. Comparado sem acento e sem diferença de maiúscula.
+    categoriaRaiz: 'Adaptação/Dependência',
+    // Nome da seção criada no topo da sala. Serve também de marca: sala que
+    // já tiver uma seção com este nome é pulada, então rodar duas vezes não
+    // duplica nada. Dá para trocar direto no painel.
+    nomeDaSecao: 'AVISO',
+    // HTML opcional colocado acima da imagem (ex.: '<p>Leia o aviso abaixo.</p>').
+    textoAntesDaImagem: '',
+    pausaEntreSalasMs: 900,
+    pausaEntrePaginasMs: 250,
+    pausaAjaxMs: 350,
   };
 
   const ORIGEM = location.origin;
@@ -876,6 +896,493 @@
   }
 
   // ----------------------------------------------------------------------
+  // Imagem no topo das salas (somente Adaptação/Dependência)
+  // ----------------------------------------------------------------------
+  // Este bloco é independente de tudo que está acima: a conferência de
+  // material de apoio continua exatamente como era. O que ele faz, em ordem:
+  //   1. descobre todas as salas que existem dentro da(s) categoria(s)
+  //      marcada(s) no painel (entrando também nas subcategorias);
+  //   2. cria uma seção nova logo abaixo de "Geral", ou seja, no topo da
+  //      página da sala;
+  //   3. envia a imagem escolhida e a deixa aparecendo dentro dessa seção.
+  // Sala que já tiver uma seção com o nome configurado é pulada.
+
+  const SEPARADOR_CATEGORIA = ' / ';
+
+  // O caminho vem do Moodle como "Graduação / 2026.2 / Campus Volta Redonda /
+  // Adaptação/Dependência / Administração". Separo pelo " / " (com espaços),
+  // justamente para não quebrar o nome "Adaptação/Dependência" ao meio.
+  function segmentosDoCaminho(caminho) {
+    return String(caminho || '').split(SEPARADOR_CATEGORIA).map((s) => s.trim()).filter(Boolean);
+  }
+
+  function dentroDaRaizDependencia(caminho) {
+    const alvo = norm(CONFIG_IMAGEM.categoriaRaiz);
+    return segmentosDoCaminho(caminho).some((s) => norm(s) === alvo);
+  }
+
+  function idDaCategoriaAtual() {
+    try {
+      const daUrl = new URL(location.href).searchParams.get('categoryid');
+      if (daUrl) return String(daUrl);
+    } catch (e) { /* ignora */ }
+    const m = (document.body.className || '').match(/\bcategory-(\d+)\b/);
+    return m ? m[1] : null;
+  }
+
+  // A página de categoria do Moodle traz um <select name="jump"> com TODAS as
+  // categorias do site e o caminho completo de cada uma. É a forma mais barata
+  // de saber quem é filha de quem: uma requisição só, sem paginação.
+  function mapaDeCategorias(doc) {
+    const d = doc || document;
+    const mapa = new Map();
+    d.querySelectorAll('select[name="jump"] option').forEach((op) => {
+      const valor = op.getAttribute('value') || '';
+      let id = null;
+      const m = valor.match(/categoryid=(\d+)/);
+      if (m) id = m[1];
+      else if (/^\d+$/.test(valor.trim())) id = valor.trim();
+      if (!id) return;
+      const caminho = txt(op);
+      if (caminho && !mapa.has(id)) mapa.set(id, caminho);
+    });
+    return mapa;
+  }
+
+  // Sem o <select>, monto o caminho pela trilha de navegação da própria página.
+  function caminhoPelaTrilha() {
+    const partes = [];
+    document.querySelectorAll('.breadcrumb a[href*="categoryid="], nav[aria-label] a[href*="categoryid="]')
+      .forEach((a) => { const t = txt(a); if (t && !partes.includes(t)) partes.push(t); });
+    const h1 = txt(document.querySelector('#region-main h1, h1'));
+    if (h1 && !partes.includes(h1)) partes.push(h1);
+    return partes.join(SEPARADOR_CATEGORIA);
+  }
+
+  function filhasDiretas(caminhoPai, mapa) {
+    const prefixo = caminhoPai + SEPARADOR_CATEGORIA;
+    const filhas = [];
+    for (const [id, caminho] of mapa) {
+      if (!caminho.startsWith(prefixo)) continue;
+      const resto = caminho.slice(prefixo.length);
+      if (resto.includes(SEPARADOR_CATEGORIA)) continue; // neta, não filha
+      filhas.push({ id, nome: resto, caminho });
+    }
+    filhas.sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+    return filhas;
+  }
+
+  // Descobre onde o script está sendo usado e o que pode ser oferecido no
+  // painel. Devolve sempre um objeto, mesmo quando a página não serve.
+  function contextoDaCategoria() {
+    const id = idDaCategoriaAtual();
+    if (!id) return { ok: false, motivo: 'Esta página não é a de uma categoria de cursos.' };
+
+    const mapa = mapaDeCategorias(document);
+    const caminho = mapa.get(id) || caminhoPelaTrilha();
+    if (!caminho) return { ok: false, motivo: 'Não consegui descobrir o nome desta categoria.' };
+
+    if (!dentroDaRaizDependencia(caminho)) {
+      return {
+        ok: false,
+        motivo: `Esta função só vale para "${CONFIG_IMAGEM.categoriaRaiz}". Você está em: ${caminho}`,
+      };
+    }
+
+    let filhas = mapa.size ? filhasDiretas(caminho, mapa) : [];
+    if (!filhas.length) {
+      // Categoria folha (já é o curso em si) ou site sem o <select>: ofereço a
+      // própria categoria aberta.
+      const nome = segmentosDoCaminho(caminho).pop() || caminho;
+      filhas = [{ id, nome: `${nome} (esta categoria)`, caminho }];
+    }
+    return { ok: true, id, caminho, mapa, filhas };
+  }
+
+  // ----------------------------------------------------------------------
+  // Salas de uma categoria (entrando nas subcategorias)
+  // ----------------------------------------------------------------------
+  async function baixaPaginaComHtml(url, opcoes) {
+    try {
+      const resp = await fetch(url, Object.assign({ credentials: 'same-origin' }, opcoes || {}));
+      const html = await resp.text();
+      return {
+        url: resp.url || url, status: resp.status, ok: resp.ok, html,
+        doc: new DOMParser().parseFromString(html, 'text/html'),
+      };
+    } catch (e) {
+      return { url, status: 0, ok: false, html: '', doc: null, erro: e.message };
+    }
+  }
+
+  // Só aceito como subcategoria o bloco que o Moodle desenha na listagem
+  // (div.category[data-categoryid]). Link solto com "categoryid=" não serve:
+  // poderia ser o link de volta para a categoria pai e a varredura subiria a
+  // árvore inteira, pegando salas que não foram pedidas.
+  function subcategoriasNaPagina(doc) {
+    const escopo = doc.querySelector('#region-main') || doc.body;
+    const ids = [];
+    escopo.querySelectorAll('.category[data-categoryid]').forEach((el) => {
+      const id = el.getAttribute('data-categoryid');
+      if (id && !ids.includes(id)) ids.push(id);
+    });
+    return ids;
+  }
+
+  async function salasDaCategoria(categoryid, contexto, anota) {
+    const salas = new Map();
+    const fila = [String(categoryid)];
+    const categoriasVistas = new Set(fila);
+    const caminhoRaiz = contexto && contexto.mapa ? contexto.mapa.get(String(categoryid)) : null;
+
+    while (fila.length) {
+      if (interromper) break;
+      const cat = fila.shift();
+      const paginas = [`${ORIGEM}/course/index.php?categoryid=${encodeURIComponent(cat)}`];
+      const paginasVistas = new Set(paginas);
+
+      while (paginas.length) {
+        if (interromper) break;
+        const url = paginas.shift();
+        const r = await baixaPagina(url);
+        if (!r.doc) { if (anota) anota(`   não consegui abrir ${url}`); continue; }
+        const escopo = r.doc.querySelector('#region-main') || r.doc.body;
+
+        escopo.querySelectorAll('a[href*="/course/view.php?id="]').forEach((a) => {
+          const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
+          const nome = txt(a);
+          if (id && nome && !salas.has(id)) salas.set(id, nome);
+        });
+
+        subcategoriasNaPagina(r.doc).forEach((id) => {
+          if (categoriasVistas.has(id)) return;
+          // Trava extra: quando conheço a árvore, só entro em quem realmente
+          // está abaixo da categoria escolhida.
+          if (caminhoRaiz) {
+            const caminhoFilha = contexto.mapa.get(id);
+            if (caminhoFilha && !caminhoFilha.startsWith(caminhoRaiz + SEPARADOR_CATEGORIA)) return;
+          }
+          categoriasVistas.add(id);
+          fila.push(id);
+        });
+
+        // A listagem vem paginada (20 por página): sigo os links de paginação.
+        escopo.querySelectorAll('.paging a[href], nav a[href*="page="]').forEach((a) => {
+          const destino = new URL(a.getAttribute('href'), ORIGEM).href;
+          if (!destino.includes('categoryid=')) return;
+          if (paginasVistas.has(destino)) return;
+          paginasVistas.add(destino);
+          paginas.push(destino);
+        });
+
+        await dorme(CONFIG_IMAGEM.pausaEntrePaginasMs);
+      }
+    }
+
+    return [...salas].map(([id, nome]) => ({ id, nome }));
+  }
+
+  // ----------------------------------------------------------------------
+  // Criar a seção e pôr a imagem dentro
+  // ----------------------------------------------------------------------
+  function nomeCruDaSecao(s) {
+    return (s && (s.title || s.name)) ? String(s.title || s.name) : '';
+  }
+
+  function secaoJaExistente(estado, nomeProcurado) {
+    const alvo = norm(nomeProcurado);
+    if (!alvo) return null;
+    return ((estado && estado.section) || []).find((s) => norm(nomeCruDaSecao(s)) === alvo) || null;
+  }
+
+  function numeroDaSecao(s) {
+    const n = Number(s.number);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  // Cria a seção logo depois da seção 0 ("Geral"), que é o topo da página da
+  // sala. O Moodle faz isso sozinho quando recebe targetsectionid: a nova
+  // seção entra na posição seguinte à indicada.
+  async function criaSecaoNoTopo(courseid, estadoAntes) {
+    const secoes = (estadoAntes && estadoAntes.section) || [];
+    const geral = secoes.find((s) => numeroDaSecao(s) === 0);
+    if (!geral) throw new Error('não achei a seção "Geral" (seção 0) desta sala');
+
+    const idsAntes = new Set(secoes.map((s) => String(s.id)));
+
+    await chamadaAjax('core_courseformat_update_course', {
+      action: 'section_add', courseid: Number(courseid), ids: [], targetsectionid: Number(geral.id),
+    });
+
+    const estadoDepois = await pegaEstadoCurso(courseid);
+    const novas = ((estadoDepois && estadoDepois.section) || []).filter((s) => !idsAntes.has(String(s.id)));
+    if (!novas.length) throw new Error('a seção foi pedida, mas o Moodle não devolveu nenhuma seção nova');
+    return { secao: novas[0], estado: estadoDepois };
+  }
+
+  // O id da instância do repositório "Enviar um arquivo" e o contexto saem do
+  // próprio HTML da página de edição da seção — é o mesmo dado que o seletor
+  // de arquivos do Moodle usa quando alguém envia um arquivo pela tela.
+  function achaRepositorioDeEnvio(html) {
+    const direto = html.match(/"id"\s*:\s*(\d+)\s*,\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"type"\s*:\s*"upload"/);
+    if (direto) return direto[1];
+    const blocos = html.match(/\{[^{}]*"type"\s*:\s*"upload"[^{}]*\}/g) || [];
+    for (const bloco of blocos) {
+      const m = bloco.match(/"id"\s*:\s*(\d+)/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  function achaContextId(html) {
+    const m = html.match(/"contextid"\s*:\s*(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // Manda o arquivo para a área de rascunho do usuário (o mesmo lugar onde o
+  // Moodle guarda um arquivo recém-enviado antes de salvar o formulário).
+  async function enviaArquivoParaRascunho(arquivo, itemid, repoId, ctxId) {
+    const sesskey = pegaSesskey();
+    if (!sesskey) throw new Error('sesskey não encontrado nesta página');
+
+    const dados = new FormData();
+    dados.append('sesskey', sesskey);
+    dados.append('repo_id', String(repoId));
+    dados.append('itemid', String(itemid));
+    dados.append('ctx_id', String(ctxId));
+    dados.append('env', 'editor');
+    dados.append('savepath', '/');
+    dados.append('title', arquivo.name);
+    dados.append('overwrite', '1');
+    dados.append('author', '');
+    dados.append('repo_upload_file', arquivo, arquivo.name);
+
+    const resp = await fetch(`${ORIGEM}/repository/repository_ajax.php?action=upload`, {
+      method: 'POST', credentials: 'same-origin', body: dados,
+    });
+    const bruto = await resp.text();
+    let json;
+    try {
+      json = JSON.parse(bruto);
+    } catch (e) {
+      throw new Error(`resposta inesperada ao enviar o arquivo: ${bruto.slice(0, 160)}`);
+    }
+    if (json.error) throw new Error(json.error);
+    if (!json.url) throw new Error('o servidor aceitou o envio mas não devolveu o endereço do arquivo');
+    return json;
+  }
+
+  function escapaAtributo(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function htmlDoBanner(urlArquivo, nomeArquivo) {
+    const src = escapaAtributo(urlArquivo);
+    const alt = escapaAtributo(String(nomeArquivo).replace(/\.[^.]+$/, ''));
+    return `${CONFIG_IMAGEM.textoAntesDaImagem}<p><img src="${src}" alt="${alt}" class="img-fluid" style="max-width:100%;height:auto;" /></p>`;
+  }
+
+  // Copia campo a campo o formulário que veio do DOMParser (new FormData(form)
+  // não funciona em documento que não está na tela).
+  function camposDoFormulario(form) {
+    const dados = new FormData();
+    form.querySelectorAll('input, select, textarea').forEach((campo) => {
+      const tipo = (campo.type || '').toLowerCase();
+      if (!campo.name || campo.disabled) return;
+      if (['button', 'reset', 'file', 'image', 'submit'].includes(tipo)) return;
+      if ((tipo === 'checkbox' || tipo === 'radio') && !campo.checked) return;
+      if (campo.tagName === 'SELECT') {
+        const escolhidas = [...campo.options].filter((o) => o.selected);
+        (escolhidas.length ? escolhidas : campo.options.length ? [campo.options[0]] : [])
+          .forEach((o) => dados.append(campo.name, o.value));
+        return;
+      }
+      dados.append(campo.name, campo.value);
+    });
+    return dados;
+  }
+
+  // Dá nome à seção e põe a imagem na descrição dela, num único envio do
+  // formulário "Editar seção" do Moodle.
+  async function poeImagemNaSecao(secaoId, arquivo, nomeDaSecao) {
+    const url = `${ORIGEM}/course/editsection.php?id=${encodeURIComponent(secaoId)}&sr=0`;
+    const pagina = await baixaPaginaComHtml(url);
+    if (!pagina.doc) throw new Error(`não consegui abrir a tela de edição da seção (${pagina.erro || pagina.status})`);
+
+    const form = pagina.doc.querySelector('form[action*="editsection.php"]')
+      || pagina.doc.querySelector('#region-main form');
+    if (!form) throw new Error('não achei o formulário de edição da seção');
+
+    const campoItemid = form.querySelector('input[name="summary_editor[itemid]"]');
+    if (!campoItemid || !campoItemid.value) throw new Error('não achei a área de rascunho da descrição da seção');
+
+    const repoId = achaRepositorioDeEnvio(pagina.html);
+    if (!repoId) throw new Error('não achei o repositório "Enviar um arquivo" nesta instalação do Moodle');
+    const ctxId = achaContextId(pagina.html) || '';
+
+    const enviado = await enviaArquivoParaRascunho(arquivo, campoItemid.value, repoId, ctxId);
+
+    const dados = camposDoFormulario(form);
+    dados.set('name', nomeDaSecao);
+    // Versões mais antigas do Moodle têm a caixa "usar nome padrão": com ela
+    // marcada o nome digitado seria ignorado.
+    form.querySelectorAll('input[name*="usedefaultname"]').forEach((c) => dados.set(c.name, '0'));
+    dados.set('summary_editor[text]', htmlDoBanner(enviado.url, enviado.file || arquivo.name));
+    dados.set('summary_editor[format]', '1');
+    dados.set('summary_editor[itemid]', campoItemid.value);
+
+    const botaoEnviar = form.querySelector('input[type="submit"][name], button[type="submit"][name]');
+    if (botaoEnviar) dados.set(botaoEnviar.name, botaoEnviar.value || 'Salvar');
+    else dados.set('submitbutton', 'Salvar alterações');
+
+    const acao = form.getAttribute('action') ? new URL(form.getAttribute('action'), url).href : url;
+    const resposta = await baixaPaginaComHtml(acao, { method: 'POST', body: dados });
+    if (!resposta.ok) throw new Error(`o Moodle recusou o envio (HTTP ${resposta.status})`);
+    // Quando salva, o Moodle redireciona para a página da sala. Se voltar o
+    // próprio formulário, alguma validação reprovou.
+    if (/editsection\.php/.test(resposta.url) && !/\/course\/view\.php/.test(resposta.url)) {
+      const erro = txt(resposta.doc && resposta.doc.querySelector('.error, .alert-danger, .invalid-feedback'));
+      throw new Error(erro || 'o formulário de edição da seção voltou sem salvar');
+    }
+    return enviado;
+  }
+
+  // ----------------------------------------------------------------------
+  // Uma sala
+  // ----------------------------------------------------------------------
+  async function tratarSala(curso, arquivo, soConferir, nomeDaSecao) {
+    const estado = await pegaEstadoCurso(curso.id);
+
+    const jaTem = secaoJaExistente(estado, nomeDaSecao);
+    if (jaTem) return { situacao: 'pulada', detalhe: `já tem a seção "${nomeCruDaSecao(jaTem)}"` };
+
+    if (soConferir) return { situacao: 'receberia', detalhe: 'ainda não tem a seção' };
+
+    const { secao } = await criaSecaoNoTopo(curso.id, estado);
+    await dorme(CONFIG_IMAGEM.pausaAjaxMs);
+    await poeImagemNaSecao(secao.id, arquivo, nomeDaSecao);
+    return { situacao: 'feita', detalhe: `seção "${nomeDaSecao}" criada no topo com a imagem` };
+  }
+
+  // ----------------------------------------------------------------------
+  // Execução do "adicionar imagem"
+  // ----------------------------------------------------------------------
+  let resumoImagem = '';
+
+  function textoResumoImagem(resultados, soConferir, nomeDaSecao, marcadas) {
+    const conta = (situacao) => resultados.filter((r) => r.situacao === situacao).length;
+    const linhas = [];
+    linhas.push(soConferir ? '=== CONFERÊNCIA (nada foi alterado) ===' : '=== IMAGEM NO TOPO DAS SALAS ===');
+    linhas.push(`Seção: ${nomeDaSecao}`);
+    linhas.push(`Cursos (categorias): ${marcadas.map((c) => c.nome).join(', ')}`);
+    linhas.push(`Salas analisadas: ${resultados.length}`);
+    if (soConferir) linhas.push(`Receberiam a imagem: ${conta('receberia')}`);
+    else linhas.push(`Com a imagem adicionada: ${conta('feita')}`);
+    linhas.push(`Puladas: ${conta('pulada')}`);
+    linhas.push(`Com erro: ${conta('erro')}`);
+
+    const porSituacao = [
+      ['receberia', 'VÃO RECEBER A IMAGEM'],
+      ['feita', 'IMAGEM ADICIONADA'],
+      ['pulada', 'PULADAS'],
+      ['erro', 'COM ERRO'],
+    ];
+    porSituacao.forEach(([chave, rotulo]) => {
+      const desta = resultados.filter((r) => r.situacao === chave);
+      if (!desta.length) return;
+      linhas.push('');
+      linhas.push(`${rotulo} (${desta.length}):`);
+      desta.forEach((r) => {
+        const extra = chave === 'receberia' ? '' : ` — ${r.detalhe}`;
+        linhas.push(`  - [${r.categoria}] ${r.curso}${extra}`);
+      });
+    });
+    return linhas.join('\n');
+  }
+
+  function copiarResumoImagem() {
+    navigator.clipboard.writeText(resumoImagem)
+      .then(() => log('Resumo copiado.', 'ok'))
+      .catch(() => log('Não consegui copiar. Selecione o texto do log e copie à mão.', 'erro'));
+  }
+
+  async function rodaImagem(soConferir) {
+    if (rodando) { log('Espere a execução que já está em andamento terminar.', 'aviso'); return; }
+
+    const contexto = contextoDaCategoria();
+    if (!contexto.ok) { log(contexto.motivo, 'erro'); return; }
+
+    const nomeDaSecao = (campoNomeSecao.value || '').trim() || CONFIG_IMAGEM.nomeDaSecao;
+    const arquivo = campoArquivo.files && campoArquivo.files[0];
+    if (!soConferir && !arquivo) { log('Escolha a imagem antes de adicionar.', 'erro'); return; }
+
+    const marcadas = [...listaCategorias.querySelectorAll('input[type="checkbox"]:checked')]
+      .map((c) => ({ id: c.value, nome: c.dataset.nome || c.value }));
+    if (!marcadas.length) { log('Marque pelo menos um curso (categoria) na lista.', 'erro'); return; }
+
+    if (!soConferir) {
+      const aviso = `Adicionar a imagem "${arquivo.name}" numa seção nova chamada "${nomeDaSecao}", `
+        + `no topo de TODAS as salas de: ${marcadas.map((c) => c.nome).join(', ')}.\n\n`
+        + 'Salas que já tiverem essa seção serão puladas. Confirmar?';
+      if (!window.confirm(aviso)) { log('Cancelado por você.', 'aviso'); return; }
+    }
+
+    rodando = true; interromper = false;
+    botaoParar.style.display = ''; botaoCopiarImagem.style.display = 'none';
+    botaoConferirImagem.disabled = true; botaoAplicarImagem.disabled = true; botao.disabled = true;
+    painelLog.innerHTML = '';
+
+    const resultados = [];
+    try {
+      log(soConferir
+        ? `Conferindo (nada será alterado) — seção procurada: "${nomeDaSecao}".`
+        : `Adicionando a imagem "${arquivo.name}" — seção "${nomeDaSecao}".`);
+
+      for (const categoria of marcadas) {
+        if (interromper) break;
+        log(`Categoria: ${categoria.nome}`);
+        const salas = await salasDaCategoria(categoria.id, contexto, (m) => log(m, 'aviso'));
+        log(`   ${salas.length} sala(s) encontrada(s).`);
+
+        for (const curso of salas) {
+          if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+          const curto = nomeCurto(curso);
+
+          if (!soConferir && perguntarSalaASala.checked) {
+            if (!window.confirm(`Adicionar a imagem em "${curto}"?`)) {
+              resultados.push({ categoria: categoria.nome, curso: curto, situacao: 'pulada', detalhe: 'você pulou esta sala' });
+              log(`   ${curto}: pulada por você.`, 'aviso');
+              continue;
+            }
+          }
+
+          try {
+            const r = await tratarSala(curso, arquivo, soConferir, nomeDaSecao);
+            resultados.push(Object.assign({ categoria: categoria.nome, curso: curto }, r));
+            const cor = r.situacao === 'feita' ? 'ok' : (r.situacao === 'pulada' ? 'aviso' : undefined);
+            log(`   ${curto}: ${r.detalhe}`, cor);
+          } catch (e) {
+            resultados.push({ categoria: categoria.nome, curso: curto, situacao: 'erro', detalhe: e.message });
+            log(`   ${curto}: ERRO — ${e.message}`, 'erro');
+          }
+          await dorme(CONFIG_IMAGEM.pausaEntreSalasMs);
+        }
+      }
+
+      resumoImagem = textoResumoImagem(resultados, soConferir, nomeDaSecao, marcadas);
+      log('');
+      resumoImagem.split('\n').forEach((l) => log(l));
+      if (resultados.length) botaoCopiarImagem.style.display = '';
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false;
+      botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+      botaoConferirImagem.disabled = false; botaoAplicarImagem.disabled = false; botao.disabled = false;
+    }
+  }
+
+  // ----------------------------------------------------------------------
   // Painel
   // ----------------------------------------------------------------------
   const painel = document.createElement('div');
@@ -947,7 +1454,139 @@
   const painelLog = document.createElement('div');
   painelLog.style.cssText = 'margin-top:8px;max-height:380px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
 
-  painel.append(titulo, labelIgnoradas, areaIgnoradas, linhaCorrigir, botoes, painelLog);
+  // --- Bloco "imagem no topo das salas" ---------------------------------
+  // Fica embaixo dos botões de sempre e só aparece com os controles ligados
+  // quando a página aberta é (ou está dentro de) "Adaptação/Dependência".
+  const CHAVE_LS_NOME_SECAO = 'ugbImagemNomeSecao';
+  const CHAVE_LS_CATEGORIAS = 'ugbImagemCategoriasMarcadas';
+
+  const blocoImagem = document.createElement('div');
+  blocoImagem.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px solid #dde;';
+
+  const tituloImagem = document.createElement('div');
+  tituloImagem.textContent = 'Adicionar imagem no topo das salas (Adaptação/Dependência)';
+  tituloImagem.style.cssText = 'font-weight:600;margin-bottom:6px;';
+
+  const recadoImagem = document.createElement('div');
+  recadoImagem.style.cssText = 'color:#8a6100;margin-bottom:6px;display:none;';
+
+  const controlesImagem = document.createElement('div');
+
+  const labelArquivo = document.createElement('div');
+  labelArquivo.textContent = '1) Escolha a imagem:';
+  labelArquivo.style.cssText = 'color:#556;margin-bottom:4px;';
+
+  const campoArquivo = document.createElement('input');
+  campoArquivo.type = 'file';
+  campoArquivo.accept = 'image/*';
+  campoArquivo.style.cssText = 'width:100%;box-sizing:border-box;margin-bottom:8px;font-size:11px;';
+
+  const labelNome = document.createElement('div');
+  labelNome.textContent = '2) Nome da seção que será criada (também serve de marca: sala que já tiver uma seção com este nome é pulada):';
+  labelNome.style.cssText = 'color:#556;margin-bottom:4px;';
+
+  const campoNomeSecao = document.createElement('input');
+  campoNomeSecao.type = 'text';
+  campoNomeSecao.style.cssText = `width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccd;
+    border-radius:6px;margin-bottom:8px;font:11px/1.4 system-ui,sans-serif;`;
+  let nomeSecaoSalvo = '';
+  try { nomeSecaoSalvo = localStorage.getItem(CHAVE_LS_NOME_SECAO) || ''; } catch (e) { /* ignora */ }
+  campoNomeSecao.value = nomeSecaoSalvo || CONFIG_IMAGEM.nomeDaSecao;
+  campoNomeSecao.addEventListener('input', () => {
+    try { localStorage.setItem(CHAVE_LS_NOME_SECAO, campoNomeSecao.value); } catch (e) { /* ignora */ }
+  });
+
+  const labelCategorias = document.createElement('div');
+  labelCategorias.textContent = '3) Marque os cursos que vão receber a imagem (todas as salas de dentro):';
+  labelCategorias.style.cssText = 'color:#556;margin-bottom:4px;';
+
+  const listaCategorias = document.createElement('div');
+  listaCategorias.style.cssText = `max-height:150px;overflow:auto;border:1px solid #ccd;border-radius:6px;
+    padding:6px;margin-bottom:6px;`;
+
+  const atalhosCategorias = document.createElement('div');
+  atalhosCategorias.style.cssText = 'display:flex;gap:10px;margin-bottom:8px;';
+  const criaAtalho = (texto, acao) => {
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = texto;
+    a.style.cssText = 'color:#2d5bd0;text-decoration:underline;cursor:pointer;font-size:11px;';
+    a.onclick = (ev) => { ev.preventDefault(); acao(); };
+    atalhosCategorias.appendChild(a);
+    return a;
+  };
+  const marcaTodas = (valor) => {
+    listaCategorias.querySelectorAll('input[type="checkbox"]').forEach((c) => { c.checked = valor; });
+    guardaCategoriasMarcadas();
+  };
+  criaAtalho('marcar todos', () => marcaTodas(true));
+  criaAtalho('desmarcar todos', () => marcaTodas(false));
+
+  function guardaCategoriasMarcadas() {
+    const ids = [...listaCategorias.querySelectorAll('input[type="checkbox"]:checked')].map((c) => c.value);
+    try { localStorage.setItem(CHAVE_LS_CATEGORIAS, JSON.stringify(ids)); } catch (e) { /* ignora */ }
+  }
+
+  function categoriasMarcadasSalvas() {
+    try { return JSON.parse(localStorage.getItem(CHAVE_LS_CATEGORIAS) || '[]'); } catch (e) { return []; }
+  }
+
+  const perguntarSalaASala = document.createElement('input');
+  perguntarSalaASala.type = 'checkbox';
+  const linhaPerguntar = document.createElement('label');
+  linhaPerguntar.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:8px;color:#334;cursor:pointer;';
+  linhaPerguntar.append(perguntarSalaASala, document.createTextNode(' Perguntar sala por sala antes de adicionar'));
+
+  const botoesImagem = document.createElement('div');
+  botoesImagem.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+  const criaBotaoImagem = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoesImagem.appendChild(b);
+    return b;
+  };
+  const botaoConferirImagem = criaBotaoImagem('Só conferir (não altera nada)', '#6c757d', () => rodaImagem(true));
+  const botaoAplicarImagem = criaBotaoImagem('Adicionar imagem nas salas', '#8a4bd0', () => rodaImagem(false));
+  const botaoCopiarImagem = criaBotaoImagem('Copiar resumo da imagem', '#2d5bd0', copiarResumoImagem);
+  botaoCopiarImagem.style.display = 'none';
+
+  controlesImagem.append(
+    labelArquivo, campoArquivo,
+    labelNome, campoNomeSecao,
+    labelCategorias, listaCategorias, atalhosCategorias,
+    linhaPerguntar, botoesImagem,
+  );
+  blocoImagem.append(tituloImagem, recadoImagem, controlesImagem);
+
+  // Monta a lista de cursos a partir da árvore de categorias da própria
+  // página. Se a página não for de Adaptação/Dependência, some com os
+  // controles e explica o porquê — o resto do painel continua funcionando.
+  (function preparaBlocoImagem() {
+    const contexto = contextoDaCategoria();
+    if (!contexto.ok) {
+      controlesImagem.style.display = 'none';
+      recadoImagem.style.display = '';
+      recadoImagem.textContent = contexto.motivo;
+      return;
+    }
+    const salvas = categoriasMarcadasSalvas();
+    contexto.filhas.forEach((cat) => {
+      const linha = document.createElement('label');
+      linha.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;padding:1px 0;';
+      const caixa = document.createElement('input');
+      caixa.type = 'checkbox';
+      caixa.value = cat.id;
+      caixa.dataset.nome = cat.nome;
+      caixa.checked = salvas.includes(cat.id);
+      caixa.addEventListener('change', guardaCategoriasMarcadas);
+      linha.append(caixa, document.createTextNode(` ${cat.nome}`));
+      listaCategorias.appendChild(linha);
+    });
+  })();
+
+  painel.append(titulo, labelIgnoradas, areaIgnoradas, linhaCorrigir, botoes, blocoImagem, painelLog);
   document.body.appendChild(painel);
 
   function log(msg, tipo) {
