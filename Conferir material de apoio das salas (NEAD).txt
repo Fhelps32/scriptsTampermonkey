@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir material de apoio das salas (NEAD)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.3
+// @version      2.4
 // @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias, quem é o professor de cada uma, detecta e corrige tópicos/atividades ocultos dos estudantes — e, dentro de Adaptação/Dependência, põe uma imagem numa seção nova no topo de todas as salas de um curso.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -77,8 +77,13 @@
     // já tiver uma seção com este nome é pulada, então rodar duas vezes não
     // duplica nada. Dá para trocar direto no painel.
     nomeDaSecao: 'AVISO',
-    // HTML opcional colocado acima da imagem (ex.: '<p>Leia o aviso abaixo.</p>').
-    textoAntesDaImagem: '',
+    // Texto opcional colocado ABAIXO da imagem, em HTML
+    // (ex.: '<p><strong>Prezado aluno,</strong></p>'). Dá para escrever
+    // direto no painel; deixe vazio para pôr só a imagem.
+    textoAbaixoDaImagem: '',
+    // Quantos ids tentar quando for preciso descobrir o repositório
+    // "Enviar um arquivo" perguntando ao Moodle, um a um.
+    idsDeRepositorioParaSondar: 25,
     pausaEntreSalasMs: 900,
     pausaEntrePaginasMs: 250,
     pausaAjaxMs: 350,
@@ -1120,18 +1125,68 @@
     return { secao: novas[0], estado: estadoDepois };
   }
 
-  // O id da instância do repositório "Enviar um arquivo" e o contexto saem do
-  // próprio HTML da página de edição da seção — é o mesmo dado que o seletor
-  // de arquivos do Moodle usa quando alguém envia um arquivo pela tela.
-  function achaRepositorioDeEnvio(html) {
-    const direto = html.match(/"id"\s*:\s*(\d+)\s*,\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"type"\s*:\s*"upload"/);
-    if (direto) return direto[1];
-    const blocos = html.match(/\{[^{}]*"type"\s*:\s*"upload"[^{}]*\}/g) || [];
-    for (const bloco of blocos) {
-      const m = bloco.match(/"id"\s*:\s*(\d+)/);
-      if (m) return m[1];
+  // O id da instância do repositório "Enviar um arquivo" é o mesmo no site
+  // inteiro, então descubro uma vez só e guardo. Procuro em três lugares, do
+  // mais barato para o mais caro, porque o formato da página muda conforme o
+  // editor de texto instalado (Atto, TinyMCE…) e eu não quero depender disso.
+  let _repositorioDeEnvio = null;
+
+  function procuraRepositorioNoHtml(html) {
+    if (!html) return null;
+    // Em algumas telas o JSON vem escapado dentro de um atributo HTML.
+    const textos = [html, html.replace(/&quot;/g, '"').replace(/&amp;/g, '&')];
+    for (const texto of textos) {
+      const direto = texto.match(/"id"\s*:\s*(\d+)\s*,\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"type"\s*:\s*"upload"/);
+      if (direto) return direto[1];
+      const blocos = texto.match(/\{[^{}]*"type"\s*:\s*"upload"[^{}]*\}/g) || [];
+      for (const bloco of blocos) {
+        const m = bloco.match(/"id"\s*:\s*(\d+)/);
+        if (m) return m[1];
+      }
     }
     return null;
+  }
+
+  // Última tentativa: pergunta ao próprio Moodle. O repositório "Enviar um
+  // arquivo" é o único que responde com um formulário de envio (upload.id
+  // "repo-form"), então dá para reconhecê-lo testando os ids um a um.
+  async function sondaRepositorioDeEnvio(ctxId) {
+    const sesskey = pegaSesskey();
+    if (!sesskey) return null;
+    for (let id = 1; id <= CONFIG_IMAGEM.idsDeRepositorioParaSondar; id++) {
+      const dados = new FormData();
+      dados.append('sesskey', sesskey);
+      dados.append('repo_id', String(id));
+      if (ctxId) dados.append('ctx_id', String(ctxId));
+      dados.append('env', 'editor');
+      let json = null;
+      try {
+        const resp = await fetch(`${ORIGEM}/repository/repository_ajax.php?action=list`, {
+          method: 'POST', credentials: 'same-origin', body: dados,
+        });
+        json = JSON.parse(await resp.text());
+      } catch (e) { continue; }
+      if (json && json.upload && json.upload.id === 'repo-form') return String(id);
+    }
+    return null;
+  }
+
+  async function idDoRepositorioDeEnvio(htmlDaPagina, ctxId, anota) {
+    if (_repositorioDeEnvio) return _repositorioDeEnvio;
+
+    let id = procuraRepositorioNoHtml(htmlDaPagina);
+    if (id) { _repositorioDeEnvio = id; if (anota) anota(`   (repositório de envio nº ${id}, achado na própria tela)`); return id; }
+
+    // "Arquivos privados" tem um gerenciador de arquivos e lista os
+    // repositórios no HTML em qualquer versão do Moodle.
+    const privados = await baixaPaginaComHtml(`${ORIGEM}/user/files.php`);
+    id = procuraRepositorioNoHtml(privados.html);
+    if (id) { _repositorioDeEnvio = id; if (anota) anota(`   (repositório de envio nº ${id}, achado em Arquivos privados)`); return id; }
+
+    id = await sondaRepositorioDeEnvio(ctxId);
+    if (id) { _repositorioDeEnvio = id; if (anota) anota(`   (repositório de envio nº ${id}, achado perguntando ao Moodle)`); return id; }
+
+    throw new Error('não achei o repositório "Enviar um arquivo". Dica: use o campo de endereço (URL) da imagem no painel');
   }
 
   function achaContextId(html) {
@@ -1176,10 +1231,14 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  function htmlDoBanner(urlArquivo, nomeArquivo) {
-    const src = escapaAtributo(urlArquivo);
-    const alt = escapaAtributo(String(nomeArquivo).replace(/\.[^.]+$/, ''));
-    return `${CONFIG_IMAGEM.textoAntesDaImagem}<p><img src="${src}" alt="${alt}" class="img-fluid" style="max-width:100%;height:auto;" /></p>`;
+  // Mesmo formato do rótulo que já existe nas suas salas: a imagem centralizada,
+  // ocupando a largura do tópico, e o texto (se houver) logo abaixo.
+  function htmlDoRotulo(urlImagem, nomeImagem, textoAbaixo) {
+    const src = escapaAtributo(urlImagem);
+    const alt = escapaAtributo(String(nomeImagem || '').replace(/\.[^.]+$/, ''));
+    const imagem = `<p style="text-align: center;"><img class="img-fluid" style="width: 100%;" src="${src}" alt="${alt}"></p>`;
+    const texto = (textoAbaixo || '').trim();
+    return texto ? `${imagem}\n${texto}` : imagem;
   }
 
   // Copia campo a campo o formulário que veio do DOMParser (new FormData(form)
@@ -1202,9 +1261,24 @@
     return dados;
   }
 
-  // Dá nome à seção e põe a imagem na descrição dela, num único envio do
-  // formulário "Editar seção" do Moodle.
-  async function poeImagemNaSecao(secaoId, arquivo, nomeDaSecao) {
+  function apertaOBotaoDeSalvar(form, dados) {
+    // Pego o botão de salvar pelo nome, nunca o "Cancelar": mandar o cancelar
+    // junto faria o Moodle descartar tudo.
+    const botoes = [...form.querySelectorAll('input[type="submit"][name], button[type="submit"][name]')];
+    const salvar = botoes.find((b) => /^submitbutton/.test(b.name)) || botoes.find((b) => !/cancel/i.test(b.name));
+    if (salvar) dados.set(salvar.name, salvar.value || 'Salvar');
+    else dados.set('submitbutton', 'Salvar alterações');
+  }
+
+  async function enviaFormulario(form, urlDaPagina, dados) {
+    const acao = form.getAttribute('action')
+      ? new URL(form.getAttribute('action'), urlDaPagina).href
+      : urlDaPagina;
+    return baixaPaginaComHtml(acao, { method: 'POST', body: dados });
+  }
+
+  // Dá nome à seção recém-criada. É esse nome que marca a sala como já feita.
+  async function nomeiaSecao(secaoId, nomeDaSecao) {
     const url = `${ORIGEM}/course/editsection.php?id=${encodeURIComponent(secaoId)}&sr=0`;
     const pagina = await baixaPaginaComHtml(url);
     if (!pagina.doc) throw new Error(`não consegui abrir a tela de edição da seção (${pagina.erro || pagina.status})`);
@@ -1213,44 +1287,64 @@
       || pagina.doc.querySelector('#region-main form');
     if (!form) throw new Error('não achei o formulário de edição da seção');
 
-    const campoItemid = form.querySelector('input[name="summary_editor[itemid]"]');
-    if (!campoItemid || !campoItemid.value) throw new Error('não achei a área de rascunho da descrição da seção');
-
-    const repoId = achaRepositorioDeEnvio(pagina.html);
-    if (!repoId) throw new Error('não achei o repositório "Enviar um arquivo" nesta instalação do Moodle');
-    const ctxId = achaContextId(pagina.html) || '';
-
-    const enviado = await enviaArquivoParaRascunho(arquivo, campoItemid.value, repoId, ctxId);
-
     const dados = camposDoFormulario(form);
     dados.set('name', nomeDaSecao);
     // Versões mais antigas do Moodle têm a caixa "usar nome padrão": com ela
     // marcada o nome digitado seria ignorado.
     form.querySelectorAll('input[name*="usedefaultname"]').forEach((c) => dados.set(c.name, '0'));
-    dados.set('summary_editor[text]', htmlDoBanner(enviado.url, enviado.file || arquivo.name));
-    dados.set('summary_editor[format]', '1');
-    dados.set('summary_editor[itemid]', campoItemid.value);
+    apertaOBotaoDeSalvar(form, dados);
 
-    const botaoEnviar = form.querySelector('input[type="submit"][name], button[type="submit"][name]');
-    if (botaoEnviar) dados.set(botaoEnviar.name, botaoEnviar.value || 'Salvar');
-    else dados.set('submitbutton', 'Salvar alterações');
-
-    const acao = form.getAttribute('action') ? new URL(form.getAttribute('action'), url).href : url;
-    const resposta = await baixaPaginaComHtml(acao, { method: 'POST', body: dados });
-    if (!resposta.ok) throw new Error(`o Moodle recusou o envio (HTTP ${resposta.status})`);
-    // Quando salva, o Moodle redireciona para a página da sala. Se voltar o
-    // próprio formulário, alguma validação reprovou.
+    const resposta = await enviaFormulario(form, url, dados);
+    if (!resposta.ok) throw new Error(`o Moodle recusou o nome da seção (HTTP ${resposta.status})`);
     if (/editsection\.php/.test(resposta.url) && !/\/course\/view\.php/.test(resposta.url)) {
       const erro = txt(resposta.doc && resposta.doc.querySelector('.error, .alert-danger, .invalid-feedback'));
-      throw new Error(erro || 'o formulário de edição da seção voltou sem salvar');
+      throw new Error(erro || 'a tela de edição da seção voltou sem salvar o nome');
     }
-    return enviado;
+  }
+
+  // Cria dentro da seção um rótulo ("Área de texto e mídia") com a imagem —
+  // o mesmo tipo de item que já é usado hoje nas salas.
+  async function criaRotuloComImagem(courseid, secaoId, imagem, nomeDoRotulo, textoAbaixo, anota) {
+    const url = `${ORIGEM}/course/modedit.php?add=label&type=&course=${encodeURIComponent(courseid)}`
+      + `&sectionid=${encodeURIComponent(secaoId)}&return=0&sr=0`;
+    const pagina = await baixaPaginaComHtml(url);
+    if (!pagina.doc) throw new Error(`não consegui abrir a tela do rótulo (${pagina.erro || pagina.status})`);
+
+    const form = pagina.doc.querySelector('form[action*="modedit.php"]')
+      || pagina.doc.querySelector('#region-main form');
+    if (!form) throw new Error('não achei o formulário do rótulo');
+
+    let urlImagem = imagem.url;
+    let nomeImagem = imagem.url;
+
+    if (imagem.arquivo) {
+      const campoItemid = form.querySelector('input[name="introeditor[itemid]"]');
+      if (!campoItemid || !campoItemid.value) throw new Error('não achei a área de rascunho do texto do rótulo');
+      const ctxId = achaContextId(pagina.html) || '';
+      const repoId = await idDoRepositorioDeEnvio(pagina.html, ctxId, anota);
+      const enviado = await enviaArquivoParaRascunho(imagem.arquivo, campoItemid.value, repoId, ctxId);
+      urlImagem = enviado.url;
+      nomeImagem = enviado.file || imagem.arquivo.name;
+    }
+
+    const dados = camposDoFormulario(form);
+    dados.set('name', nomeDoRotulo);
+    dados.set('introeditor[text]', htmlDoRotulo(urlImagem, nomeImagem, textoAbaixo));
+    dados.set('introeditor[format]', '1');
+    apertaOBotaoDeSalvar(form, dados);
+
+    const resposta = await enviaFormulario(form, url, dados);
+    if (!resposta.ok) throw new Error(`o Moodle recusou o rótulo (HTTP ${resposta.status})`);
+    if (/modedit\.php/.test(resposta.url) && !/\/course\/(view|section)\.php/.test(resposta.url)) {
+      const erro = txt(resposta.doc && resposta.doc.querySelector('.error, .alert-danger, .invalid-feedback'));
+      throw new Error(erro || 'o formulário do rótulo voltou sem salvar');
+    }
   }
 
   // ----------------------------------------------------------------------
   // Uma sala
   // ----------------------------------------------------------------------
-  async function tratarSala(curso, arquivo, soConferir, nomeDaSecao) {
+  async function tratarSala(curso, imagem, soConferir, nomeDaSecao, textoAbaixo, anota) {
     const estado = await pegaEstadoCurso(curso.id);
 
     const jaTem = secaoJaExistente(estado, nomeDaSecao);
@@ -1260,8 +1354,10 @@
 
     const { secao } = await criaSecaoNoTopo(curso.id, estado);
     await dorme(CONFIG_IMAGEM.pausaAjaxMs);
-    await poeImagemNaSecao(secao.id, arquivo, nomeDaSecao);
-    return { situacao: 'feita', detalhe: `seção "${nomeDaSecao}" criada no topo com a imagem` };
+    await nomeiaSecao(secao.id, nomeDaSecao);
+    await dorme(CONFIG_IMAGEM.pausaAjaxMs);
+    await criaRotuloComImagem(curso.id, secao.id, imagem, nomeDaSecao, textoAbaixo, anota);
+    return { situacao: 'feita', detalhe: `seção "${nomeDaSecao}" criada no topo com a imagem dentro` };
   }
 
   // ----------------------------------------------------------------------
@@ -1313,15 +1409,25 @@
     if (!contexto.ok) { log(contexto.motivo, 'erro'); return; }
 
     const nomeDaSecao = (campoNomeSecao.value || '').trim() || CONFIG_IMAGEM.nomeDaSecao;
+    const textoAbaixo = campoTextoAbaixo.value || CONFIG_IMAGEM.textoAbaixoDaImagem;
+
+    // A imagem pode vir de um arquivo do computador ou de um endereço que já
+    // esteja publicado (como o calendário que vocês usam hoje).
     const arquivo = campoArquivo.files && campoArquivo.files[0];
-    if (!soConferir && !arquivo) { log('Escolha a imagem antes de adicionar.', 'erro'); return; }
+    const endereco = (campoUrlImagem.value || '').trim();
+    const imagem = arquivo ? { arquivo } : (endereco ? { url: endereco } : null);
+    if (!soConferir && !imagem) {
+      log('Escolha uma imagem do computador ou cole o endere\u00e7o de uma imagem.', 'erro');
+      return;
+    }
 
     const marcadas = [...listaCategorias.querySelectorAll('input[type="checkbox"]:checked')]
       .map((c) => ({ id: c.value, nome: c.dataset.nome || c.value }));
     if (!marcadas.length) { log('Marque pelo menos um curso (categoria) na lista.', 'erro'); return; }
 
     if (!soConferir) {
-      const aviso = `Adicionar a imagem "${arquivo.name}" numa seção nova chamada "${nomeDaSecao}", `
+      const comoChamar = arquivo ? arquivo.name : endereco;
+      const aviso = `Adicionar a imagem "${comoChamar}" numa seção nova chamada "${nomeDaSecao}", `
         + `no topo de TODAS as salas de: ${marcadas.map((c) => c.nome).join(', ')}.\n\n`
         + 'Salas que já tiverem essa seção serão puladas. Confirmar?';
       if (!window.confirm(aviso)) { log('Cancelado por você.', 'aviso'); return; }
@@ -1336,7 +1442,7 @@
     try {
       log(soConferir
         ? `Conferindo (nada será alterado) — seção procurada: "${nomeDaSecao}".`
-        : `Adicionando a imagem "${arquivo.name}" — seção "${nomeDaSecao}".`);
+        : `Adicionando a imagem "${arquivo ? arquivo.name : endereco}" — seção "${nomeDaSecao}".`);
 
       for (const categoria of marcadas) {
         if (interromper) break;
@@ -1357,7 +1463,7 @@
           }
 
           try {
-            const r = await tratarSala(curso, arquivo, soConferir, nomeDaSecao);
+            const r = await tratarSala(curso, imagem, soConferir, nomeDaSecao, textoAbaixo, (m) => log(m));
             resultados.push(Object.assign({ categoria: categoria.nome, curso: curto }, r));
             const cor = r.situacao === 'feita' ? 'ok' : (r.situacao === 'pulada' ? 'aviso' : undefined);
             log(`   ${curto}: ${r.detalhe}`, cor);
@@ -1459,6 +1565,8 @@
   // quando a página aberta é (ou está dentro de) "Adaptação/Dependência".
   const CHAVE_LS_NOME_SECAO = 'ugbImagemNomeSecao';
   const CHAVE_LS_CATEGORIAS = 'ugbImagemCategoriasMarcadas';
+  const CHAVE_LS_URL_IMAGEM = 'ugbImagemEndereco';
+  const CHAVE_LS_TEXTO_ABAIXO = 'ugbImagemTextoAbaixo';
 
   const blocoImagem = document.createElement('div');
   blocoImagem.style.cssText = 'margin-top:10px;padding-top:10px;border-top:1px solid #dde;';
@@ -1473,13 +1581,29 @@
   const controlesImagem = document.createElement('div');
 
   const labelArquivo = document.createElement('div');
-  labelArquivo.textContent = '1) Escolha a imagem:';
+  labelArquivo.textContent = '1) Escolha a imagem do computador…';
   labelArquivo.style.cssText = 'color:#556;margin-bottom:4px;';
 
   const campoArquivo = document.createElement('input');
   campoArquivo.type = 'file';
   campoArquivo.accept = 'image/*';
-  campoArquivo.style.cssText = 'width:100%;box-sizing:border-box;margin-bottom:8px;font-size:11px;';
+  campoArquivo.style.cssText = 'width:100%;box-sizing:border-box;margin-bottom:6px;font-size:11px;';
+
+  const labelUrl = document.createElement('div');
+  labelUrl.textContent = '… ou cole o endereço (URL) de uma imagem já publicada:';
+  labelUrl.style.cssText = 'color:#556;margin-bottom:4px;';
+
+  const campoUrlImagem = document.createElement('input');
+  campoUrlImagem.type = 'text';
+  campoUrlImagem.placeholder = 'https://…/imagem.jpg';
+  campoUrlImagem.style.cssText = `width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccd;
+    border-radius:6px;margin-bottom:8px;font:11px/1.4 system-ui,sans-serif;`;
+  let urlSalva = '';
+  try { urlSalva = localStorage.getItem(CHAVE_LS_URL_IMAGEM) || ''; } catch (e) { /* ignora */ }
+  campoUrlImagem.value = urlSalva;
+  campoUrlImagem.addEventListener('input', () => {
+    try { localStorage.setItem(CHAVE_LS_URL_IMAGEM, campoUrlImagem.value); } catch (e) { /* ignora */ }
+  });
 
   const labelNome = document.createElement('div');
   labelNome.textContent = '2) Nome da seção que será criada (também serve de marca: sala que já tiver uma seção com este nome é pulada):';
@@ -1496,8 +1620,23 @@
     try { localStorage.setItem(CHAVE_LS_NOME_SECAO, campoNomeSecao.value); } catch (e) { /* ignora */ }
   });
 
+  const labelTextoAbaixo = document.createElement('div');
+  labelTextoAbaixo.textContent = '3) Texto abaixo da imagem (opcional, aceita HTML):';
+  labelTextoAbaixo.style.cssText = 'color:#556;margin-bottom:4px;';
+
+  const campoTextoAbaixo = document.createElement('textarea');
+  campoTextoAbaixo.placeholder = 'Ex.: <p><strong>Prezado aluno,</strong></p>';
+  campoTextoAbaixo.style.cssText = `width:100%;box-sizing:border-box;min-height:44px;resize:vertical;
+    font:11px/1.4 system-ui,sans-serif;padding:6px;border:1px solid #ccd;border-radius:6px;margin-bottom:8px;`;
+  let textoAbaixoSalvo = '';
+  try { textoAbaixoSalvo = localStorage.getItem(CHAVE_LS_TEXTO_ABAIXO) || ''; } catch (e) { /* ignora */ }
+  campoTextoAbaixo.value = textoAbaixoSalvo || CONFIG_IMAGEM.textoAbaixoDaImagem;
+  campoTextoAbaixo.addEventListener('input', () => {
+    try { localStorage.setItem(CHAVE_LS_TEXTO_ABAIXO, campoTextoAbaixo.value); } catch (e) { /* ignora */ }
+  });
+
   const labelCategorias = document.createElement('div');
-  labelCategorias.textContent = '3) Marque os cursos que vão receber a imagem (todas as salas de dentro):';
+  labelCategorias.textContent = '4) Marque os cursos que vão receber a imagem (todas as salas de dentro):';
   labelCategorias.style.cssText = 'color:#556;margin-bottom:4px;';
 
   const listaCategorias = document.createElement('div');
@@ -1554,7 +1693,9 @@
 
   controlesImagem.append(
     labelArquivo, campoArquivo,
+    labelUrl, campoUrlImagem,
     labelNome, campoNomeSecao,
+    labelTextoAbaixo, campoTextoAbaixo,
     labelCategorias, listaCategorias, atalhosCategorias,
     linhaPerguntar, botoesImagem,
   );
