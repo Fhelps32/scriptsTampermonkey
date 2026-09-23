@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir material de apoio das salas (NEAD)
 // @namespace    https://nead.ugb.edu.br/
-// @version      2.4
+// @version      2.5
 // @description  Onde usar: abra no NEAD a categoria com a lista das salas e use o painel no canto da tela. Diz quais salas têm material de apoio, quais estão vazias, quem é o professor de cada uma, detecta e corrige tópicos/atividades ocultos dos estudantes — e, dentro de Adaptação/Dependência, põe uma imagem numa seção nova no topo de todas as salas de um curso.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -84,6 +84,9 @@
     // Quantos ids tentar quando for preciso descobrir o repositório
     // "Enviar um arquivo" perguntando ao Moodle, um a um.
     idsDeRepositorioParaSondar: 25,
+    // Onde a seção nova tem de ficar. 1 é logo abaixo do "Geral" (a seção 0),
+    // que o Moodle sempre desenha primeiro e não deixa mover.
+    posicaoDesejada: 1,
     pausaEntreSalasMs: 900,
     pausaEntrePaginasMs: 250,
     pausaAjaxMs: 350,
@@ -1105,9 +1108,20 @@
     return Number.isFinite(n) ? n : NaN;
   }
 
-  // Cria a seção logo depois da seção 0 ("Geral"), que é o topo da página da
-  // sala. O Moodle faz isso sozinho quando recebe targetsectionid: a nova
-  // seção entra na posição seguinte à indicada.
+  function achaSecaoPorId(estado, secaoId) {
+    return ((estado && estado.section) || []).find((s) => String(s.id) === String(secaoId)) || null;
+  }
+
+  // Cria a seção logo depois da seção 0 ("Geral"), que é a posição 1 — o
+  // primeiro tópico depois do Geral, que o Moodle sempre desenha antes de
+  // tudo e não deixa mover.
+  //
+  // O Moodle cria a seção no fim e só depois a arrasta para a posição pedida
+  // (sectionactions::create_from_object). Se esse arrasto não acontecer, a
+  // seção fica lá embaixo — foi o que apareceu em algumas salas. Por isso aqui
+  // eu confiro onde ela realmente ficou e, se não estiver na posição 1, mando
+  // movê-la e confiro de novo. Sem a posição certa, a sala vira erro em vez de
+  // ficar com a imagem no lugar errado e ninguém perceber.
   async function criaSecaoNoTopo(courseid, estadoAntes) {
     const secoes = (estadoAntes && estadoAntes.section) || [];
     const geral = secoes.find((s) => numeroDaSecao(s) === 0);
@@ -1122,7 +1136,31 @@
     const estadoDepois = await pegaEstadoCurso(courseid);
     const novas = ((estadoDepois && estadoDepois.section) || []).filter((s) => !idsAntes.has(String(s.id)));
     if (!novas.length) throw new Error('a seção foi pedida, mas o Moodle não devolveu nenhuma seção nova');
-    return { secao: novas[0], estado: estadoDepois };
+    return { secao: novas[0], estado: estadoDepois, geral };
+  }
+
+  // Garante que a seção esteja na posição 1. Devolve { posicao, precisouMover }.
+  async function garantePosicaoDeTopo(courseid, secaoId, geralId) {
+    let estado = await pegaEstadoCurso(courseid);
+    let atual = achaSecaoPorId(estado, secaoId);
+    if (!atual) throw new Error('perdi a seção nova de vista ao conferir a posição');
+    if (numeroDaSecao(atual) === CONFIG_IMAGEM.posicaoDesejada) {
+      return { posicao: numeroDaSecao(atual), precisouMover: false };
+    }
+
+    await chamadaAjax('core_courseformat_update_course', {
+      action: 'section_move_after', courseid: Number(courseid),
+      ids: [Number(secaoId)], targetsectionid: Number(geralId),
+    });
+    await dorme(CONFIG_IMAGEM.pausaAjaxMs);
+
+    estado = await pegaEstadoCurso(courseid);
+    atual = achaSecaoPorId(estado, secaoId);
+    const posicao = atual ? numeroDaSecao(atual) : NaN;
+    if (posicao !== CONFIG_IMAGEM.posicaoDesejada) {
+      throw new Error(`a seção nova ficou na posição ${posicao} e não consegui trazê-la para o topo`);
+    }
+    return { posicao, precisouMover: true };
   }
 
   // O id da instância do repositório "Enviar um arquivo" é o mesmo no site
@@ -1352,12 +1390,57 @@
 
     if (soConferir) return { situacao: 'receberia', detalhe: 'ainda não tem a seção' };
 
-    const { secao } = await criaSecaoNoTopo(curso.id, estado);
+    const { secao, geral } = await criaSecaoNoTopo(curso.id, estado);
     await dorme(CONFIG_IMAGEM.pausaAjaxMs);
     await nomeiaSecao(secao.id, nomeDaSecao);
     await dorme(CONFIG_IMAGEM.pausaAjaxMs);
     await criaRotuloComImagem(curso.id, secao.id, imagem, nomeDaSecao, textoAbaixo, anota);
-    return { situacao: 'feita', detalhe: `seção "${nomeDaSecao}" criada no topo com a imagem dentro` };
+    await dorme(CONFIG_IMAGEM.pausaAjaxMs);
+
+    // Confiro a posição só no fim, com tudo já dentro: é esse o estado que o
+    // aluno vai ver.
+    const { precisouMover } = await garantePosicaoDeTopo(curso.id, secao.id, geral.id);
+    const ajuste = precisouMover ? ' (precisei arrastá-la para o topo)' : '';
+    return { situacao: 'feita', detalhe: `seção "${nomeDaSecao}" criada na posição 1, logo abaixo do Geral${ajuste}` };
+  }
+
+  // ----------------------------------------------------------------------
+  // Apagar tópicos por nome
+  // ----------------------------------------------------------------------
+  // Serve para desfazer uma execução: apaga as seções cujo nome seja
+  // exatamente o digitado (sem diferença de acento ou maiúscula), junto com o
+  // que estiver dentro delas. A seção 0 nunca é tocada — ela é o "Geral" da
+  // sala e apagá-la levaria junto o fórum de avisos e o que mais estiver lá.
+  async function apagarSecoesDaSala(curso, nomeDaSecao, soConferir) {
+    const estado = await pegaEstadoCurso(curso.id);
+    const alvo = norm(nomeDaSecao);
+    const secoes = ((estado && estado.section) || [])
+      .filter((s) => numeroDaSecao(s) !== 0 && norm(nomeCruDaSecao(s)) === alvo);
+
+    if (!secoes.length) return { situacao: 'semNada', detalhe: 'não tem tópico com esse nome' };
+
+    const descricao = secoes.map((s) => `posição ${numeroDaSecao(s)}`).join(', ');
+    if (soConferir) {
+      return { situacao: 'apagaria', detalhe: `${secoes.length} tópico(s) — ${descricao}` };
+    }
+
+    for (const s of secoes) {
+      await chamadaAjax('core_courseformat_update_course', {
+        action: 'section_delete', courseid: Number(curso.id), ids: [Number(s.id)],
+      });
+      await dorme(CONFIG_IMAGEM.pausaAjaxMs);
+    }
+
+    // Confiro que sumiu mesmo: o Moodle recusa apagar em silêncio quando a
+    // seção não pode ser removida, e eu não quero relatar como feito o que não
+    // foi feito.
+    const depois = await pegaEstadoCurso(curso.id);
+    const sobraram = ((depois && depois.section) || [])
+      .filter((s) => numeroDaSecao(s) !== 0 && norm(nomeCruDaSecao(s)) === alvo);
+    if (sobraram.length) {
+      throw new Error(`pedi para apagar ${secoes.length} tópico(s), mas ${sobraram.length} continua(m) na sala`);
+    }
+    return { situacao: 'apagada', detalhe: `${secoes.length} tópico(s) apagado(s) — ${descricao}` };
   }
 
   // ----------------------------------------------------------------------
@@ -1435,7 +1518,7 @@
 
     rodando = true; interromper = false;
     botaoParar.style.display = ''; botaoCopiarImagem.style.display = 'none';
-    botaoConferirImagem.disabled = true; botaoAplicarImagem.disabled = true; botao.disabled = true;
+    travaBotoesDaImagem(true);
     painelLog.innerHTML = '';
 
     const resultados = [];
@@ -1484,21 +1567,142 @@
     } finally {
       rodando = false; interromper = false;
       botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
-      botaoConferirImagem.disabled = false; botaoAplicarImagem.disabled = false; botao.disabled = false;
+      travaBotoesDaImagem(false);
     }
+  }
+
+
+  // ----------------------------------------------------------------------
+  // Execução do "apagar tópicos com este nome"
+  // ----------------------------------------------------------------------
+  async function rodaExclusao(soConferir) {
+    if (rodando) { log('Espere a execução que já está em andamento terminar.', 'aviso'); return; }
+
+    const contexto = contextoDaCategoria();
+    if (!contexto.ok) { log(contexto.motivo, 'erro'); return; }
+
+    const nomeDaSecao = (campoNomeSecao.value || '').trim();
+    if (!nomeDaSecao) { log('Escreva o nome do tópico que deve ser apagado.', 'erro'); return; }
+
+    const marcadas = [...listaCategorias.querySelectorAll('input[type="checkbox"]:checked')]
+      .map((c) => ({ id: c.value, nome: c.dataset.nome || c.value }));
+    if (!marcadas.length) { log('Marque pelo menos um curso (categoria) na lista.', 'erro'); return; }
+
+    if (!soConferir) {
+      const aviso = `APAGAR todos os tópicos chamados "${nomeDaSecao}" — e tudo que estiver dentro deles — `
+        + `nas salas de: ${marcadas.map((c) => c.nome).join(', ')}.\n\n`
+        + 'Isto não tem como ser desfeito. O tópico "Geral" (o primeiro da sala) nunca é apagado.\n\n'
+        + `Digite CONFIRMAR para prosseguir:`;
+      const resposta = window.prompt(aviso, '');
+      if (norm(resposta || '') !== 'CONFIRMAR') { log('Cancelado por você.', 'aviso'); return; }
+    }
+
+    rodando = true; interromper = false;
+    botaoParar.style.display = ''; botaoCopiarImagem.style.display = 'none';
+    travaBotoesDaImagem(true);
+    painelLog.innerHTML = '';
+
+    const resultados = [];
+    try {
+      log(soConferir
+        ? `Conferindo quais tópicos "${nomeDaSecao}" existem (nada será apagado).`
+        : `Apagando os tópicos chamados "${nomeDaSecao}".`, soConferir ? undefined : 'aviso');
+
+      for (const categoria of marcadas) {
+        if (interromper) break;
+        log(`Categoria: ${categoria.nome}`);
+        const salas = await salasDaCategoria(categoria.id, contexto, (m) => log(m, 'aviso'));
+        log(`   ${salas.length} sala(s) encontrada(s).`);
+
+        for (const curso of salas) {
+          if (interromper) { log('Interrompido por você.', 'aviso'); break; }
+          const curto = nomeCurto(curso);
+          try {
+            const r = await apagarSecoesDaSala(curso, nomeDaSecao, soConferir);
+            resultados.push(Object.assign({ categoria: categoria.nome, curso: curto }, r));
+            const cor = r.situacao === 'apagada' ? 'ok' : (r.situacao === 'semNada' ? undefined : 'aviso');
+            log(`   ${curto}: ${r.detalhe}`, cor);
+          } catch (e) {
+            resultados.push({ categoria: categoria.nome, curso: curto, situacao: 'erro', detalhe: e.message });
+            log(`   ${curto}: ERRO — ${e.message}`, 'erro');
+          }
+          await dorme(CONFIG_IMAGEM.pausaEntreSalasMs);
+        }
+      }
+
+      resumoImagem = textoResumoExclusao(resultados, soConferir, nomeDaSecao, marcadas);
+      log('');
+      resumoImagem.split('\n').forEach((l) => log(l));
+      if (resultados.length) botaoCopiarImagem.style.display = '';
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false;
+      botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+      travaBotoesDaImagem(false);
+    }
+  }
+
+  function textoResumoExclusao(resultados, soConferir, nomeDaSecao, marcadas) {
+    const conta = (situacao) => resultados.filter((r) => r.situacao === situacao).length;
+    const linhas = [];
+    linhas.push(soConferir ? '=== CONFERÊNCIA DA EXCLUSÃO (nada foi apagado) ===' : '=== TÓPICOS APAGADOS ===');
+    linhas.push(`Tópico procurado: ${nomeDaSecao}`);
+    linhas.push(`Cursos (categorias): ${marcadas.map((c) => c.nome).join(', ')}`);
+    linhas.push(`Salas analisadas: ${resultados.length}`);
+    if (soConferir) linhas.push(`Seriam apagadas em: ${conta('apagaria')}`);
+    else linhas.push(`Apagados em: ${conta('apagada')}`);
+    linhas.push(`Sem esse tópico: ${conta('semNada')}`);
+    linhas.push(`Com erro: ${conta('erro')}`);
+
+    [['apagaria', 'SERIAM APAGADOS'], ['apagada', 'APAGADOS'], ['erro', 'COM ERRO']].forEach(([chave, rotulo]) => {
+      const desta = resultados.filter((r) => r.situacao === chave);
+      if (!desta.length) return;
+      linhas.push('');
+      linhas.push(`${rotulo} (${desta.length}):`);
+      desta.forEach((r) => linhas.push(`  - [${r.categoria}] ${r.curso} — ${r.detalhe}`));
+    });
+    return linhas.join('\n');
   }
 
   // ----------------------------------------------------------------------
   // Painel
   // ----------------------------------------------------------------------
+  // O painel nunca pode passar do tamanho da tela: com a página ampliada
+  // (zoom), 420px de largura e a altura do conteúdo estouravam a janela e o
+  // pé do painel ficava cortado, sem como rolar. Agora ele se limita ao que
+  // cabe e quem rola é o corpo, com o título sempre à vista.
   const painel = document.createElement('div');
-  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;width:420px;
+  painel.style.cssText = `position:fixed;top:10px;right:10px;z-index:99999;
+    width:min(420px, calc(100vw - 20px));max-width:calc(100vw - 20px);
+    max-height:calc(100vh - 20px);display:flex;flex-direction:column;
     font:12px/1.45 system-ui,sans-serif;background:#fff;border:1px solid #ccd;border-radius:8px;
-    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;`;
+    box-shadow:0 6px 20px rgba(0,0,0,.18);padding:10px;box-sizing:border-box;`;
 
   const titulo = document.createElement('div');
-  titulo.textContent = 'Auditoria de conteúdo das salas';
-  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;';
+  titulo.style.cssText = 'font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px;flex:0 0 auto;';
+  const tituloTexto = document.createElement('span');
+  tituloTexto.textContent = 'Auditoria de conteúdo das salas';
+  tituloTexto.style.cssText = 'flex:1;';
+
+  // Encolher o painel ajuda quando a tela é pequena e você precisa ver a
+  // página atrás dele.
+  const botaoEncolher = document.createElement('button');
+  botaoEncolher.type = 'button';
+  botaoEncolher.textContent = '–';
+  botaoEncolher.title = 'Encolher / abrir o painel';
+  botaoEncolher.style.cssText = `flex:0 0 auto;width:24px;height:24px;line-height:1;padding:0;cursor:pointer;
+    border:1px solid #ccd;border-radius:5px;background:#f4f5f8;color:#334;font-size:14px;`;
+  titulo.append(tituloTexto, botaoEncolher);
+
+  // Tudo menos o título mora aqui, e é esta parte que rola.
+  const corpo = document.createElement('div');
+  corpo.style.cssText = 'flex:1 1 auto;overflow-y:auto;overflow-x:hidden;min-height:0;';
+  botaoEncolher.onclick = () => {
+    const escondido = corpo.style.display === 'none';
+    corpo.style.display = escondido ? '' : 'none';
+    botaoEncolher.textContent = escondido ? '–' : '+';
+  };
 
   const labelIgnoradas = document.createElement('div');
   labelIgnoradas.textContent = 'Seções que NÃO contam como conteúdo (uma por linha ou por vírgula):';
@@ -1558,7 +1762,8 @@
   const travaBotoes = (t) => { botao.disabled = t; };
 
   const painelLog = document.createElement('div');
-  painelLog.style.cssText = 'margin-top:8px;max-height:380px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+  painelLog.style.cssText = `margin-top:8px;max-height:45vh;overflow:auto;white-space:pre-wrap;
+    overflow-wrap:anywhere;font-family:ui-monospace,monospace;font-size:11px;`;
 
   // --- Bloco "imagem no topo das salas" ---------------------------------
   // Fica embaixo dos botões de sempre e só aparece com os controles ligados
@@ -1688,8 +1893,32 @@
   };
   const botaoConferirImagem = criaBotaoImagem('Só conferir (não altera nada)', '#6c757d', () => rodaImagem(true));
   const botaoAplicarImagem = criaBotaoImagem('Adicionar imagem nas salas', '#8a4bd0', () => rodaImagem(false));
-  const botaoCopiarImagem = criaBotaoImagem('Copiar resumo da imagem', '#2d5bd0', copiarResumoImagem);
+  const botaoCopiarImagem = criaBotaoImagem('Copiar resumo', '#2d5bd0', copiarResumoImagem);
   botaoCopiarImagem.style.display = 'none';
+
+  // Desfazer: apaga os tópicos que têm o nome escrito no campo 2.
+  const labelExcluir = document.createElement('div');
+  labelExcluir.textContent = 'Desfazer — apaga os tópicos que tiverem o nome escrito no campo 2, '
+    + 'com tudo que estiver dentro deles. O tópico "Geral" nunca é apagado.';
+  labelExcluir.style.cssText = 'color:#8a6100;margin:10px 0 6px;';
+
+  const botoesExcluir = document.createElement('div');
+  botoesExcluir.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+  const criaBotaoExcluir = (texto, cor, acao) => {
+    const b = document.createElement('button');
+    b.textContent = texto;
+    b.style.cssText = `padding:8px 10px;background:${cor};color:#fff;border:0;border-radius:5px;cursor:pointer;`;
+    b.onclick = acao;
+    botoesExcluir.appendChild(b);
+    return b;
+  };
+  const botaoConferirExclusao = criaBotaoExcluir('Ver o que seria apagado', '#6c757d', () => rodaExclusao(true));
+  const botaoApagarTopicos = criaBotaoExcluir('Apagar tópicos com esse nome', '#b3261e', () => rodaExclusao(false));
+
+  function travaBotoesDaImagem(travado) {
+    [botaoConferirImagem, botaoAplicarImagem, botaoConferirExclusao, botaoApagarTopicos, botao]
+      .forEach((b) => { b.disabled = travado; });
+  }
 
   controlesImagem.append(
     labelArquivo, campoArquivo,
@@ -1698,6 +1927,7 @@
     labelTextoAbaixo, campoTextoAbaixo,
     labelCategorias, listaCategorias, atalhosCategorias,
     linhaPerguntar, botoesImagem,
+    labelExcluir, botoesExcluir,
   );
   blocoImagem.append(tituloImagem, recadoImagem, controlesImagem);
 
@@ -1727,7 +1957,8 @@
     });
   })();
 
-  painel.append(titulo, labelIgnoradas, areaIgnoradas, linhaCorrigir, botoes, blocoImagem, painelLog);
+  corpo.append(labelIgnoradas, areaIgnoradas, linhaCorrigir, botoes, blocoImagem, painelLog);
+  painel.append(titulo, corpo);
   document.body.appendChild(painel);
 
   function log(msg, tipo) {
