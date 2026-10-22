@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir questões dos bancos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
-// @version      1.4
+// @version      1.5
 // @description  Onde usar: abra a categoria com a lista das salas e use o painel no canto da tela. Com um clique ele entra em todas as salas, abre os bancos de questões e procura questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem é comparada pelo conteúdo da imagem, não pelo texto vazio.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -44,11 +44,8 @@
     // erro, vem vazia ou vem com um tipo que não é imagem (costuma ser uma
     // página de erro do Moodle disfarçada).
     exigirTipoDeImagem: true,
-    baixarCsvAoFinal: true,
-    // Planilha só com as questões que têm problema. Com false, ela volta a
-    // trazer também uma linha por banco sem problema e por sala sem banco.
-    apenasProblemasNaPlanilha: true,
-    separadorCsv: ';',
+    // Ao terminar, baixa o relatório .txt com as questões que têm problema.
+    baixarRelatorioAoFinal: true,
   };
 
   const ORIGEM = location.origin;
@@ -598,7 +595,7 @@
   async function confereBanco(curso, banco, anota) {
     const resultado = {
       curso, banco, questoes: 0, lidas: 0,
-      duplicadas: [], repetidas: [], vazias: [], imagens: [], falhas: [],
+      duplicadas: [], repetidas: [], vazias: [], imagens: [], falhas: [], naoLidas: [],
     };
 
     const cats = await categoriasDoBanco(banco.cmid, anota);
@@ -615,7 +612,7 @@
         const r = await questoesDaCategoria(banco.cmid, cat, comJs);
         if (r.comFiltro === false) anota(`      categoria "${cat.nome}": li a listagem sem o filtro`);
         r.questoes.forEach((q) => {
-          if (!questoes.has(q.id)) questoes.set(q.id, { ...q, categoria: cat.nome });
+          if (!questoes.has(q.id)) questoes.set(q.id, { ...q, categoria: cat.nome, catValor: cat.valor });
         });
       }
     };
@@ -654,6 +651,7 @@
         });
       } catch (e) {
         resultado.falhas.push(`questão ${q.id}${q.nome ? ` ("${q.nome.slice(0, 60)}")` : ''}: ${e.message}`);
+        resultado.naoLidas.push({ questao: q, motivo: e.message });
       }
       await dorme(CONFIG.pausaEntreQuestoesMs);
     }
@@ -676,7 +674,7 @@
     if (rodando) return;
     rodando = true; interromper = false; relatorio = [];
     travaBotoes(true); botaoParar.style.display = ''; botaoCopiar.style.display = 'none';
-    botaoCsv.style.display = 'none';
+    botaoTxt.style.display = 'none';
     painelLog.innerHTML = '';
 
     try {
@@ -721,9 +719,9 @@
       resumo.split('\n').forEach((l) => log(l));
       if (relatorio.length) {
         botaoCopiar.style.display = '';
-        if (csvDoRelatorio().quantidade) {
-          botaoCsv.style.display = '';
-          if (CONFIG.baixarCsvAoFinal) baixarCsv();
+        if (txtDoRelatorio().quantidade) {
+          botaoTxt.style.display = '';
+          if (CONFIG.baixarRelatorioAoFinal) baixarTxt();
         }
       }
     } catch (e) {
@@ -817,68 +815,128 @@
   }
 
   // ----------------------------------------------------------------------
-  // Planilha
+  // Relatório .txt
   // ----------------------------------------------------------------------
-  // Mesmo formato do diagnóstico dos bancos: BOM + ponto e vírgula + CRLF, que
-  // é o que o Excel em português abre já em colunas.
-  // Uma linha por problema encontrado. Sala sem banco e banco sem problema
-  // ficam fora: a planilha é a lista de trabalho, e sala que está em ordem não
-  // dá trabalho. Esses dois casos continuam no resumo, que é onde servem de
-  // contexto ("conferi 19 salas, 2 não têm banco").
-  function csvDoRelatorio() {
-    const cabecalho = ['Sala', 'Banco', 'Problema', 'Categoria', 'Questão', 'Detalhe', 'Endereço'];
-    const linhas = [cabecalho];
-    const soProblemas = CONFIG.apenasProblemasNaPlanilha;
+  // Só o que serve para agir: o problema, a categoria (AV1 / AV2) e o link.
+  //
+  // O link é a listagem do banco, na categoria da questão, com ela destacada.
+  // Não existe um link que mova a questão sozinho: no Moodle 5 a categoria
+  // fica travada na tela de editar ("Categoria atual", congelada — o campo
+  // "Salvar em categoria" só aparece ao duplicar) e mover virou uma janela
+  // dentro da listagem ("Mover para…"). Então o link leva até a questão e o
+  // parâmetro lastchanged faz o Moodle pintá-la de amarelo (classe
+  // "highlight", em question/classes/local/bank/view.php).
+  function linkParaMover(r, q) {
+    const p = new URLSearchParams();
+    p.set('cmid', String(r.banco.cmid));
+    if (q.catValor) p.set('cat', q.catValor);
+    // Página grande o bastante para a questão não cair numa página 2.
+    p.set('qperpage', String(CONFIG.questoesPorPagina));
+    p.set('lastchanged', String(q.id));
+    return `${ORIGEM}/question/edit.php?${p.toString()}`;
+  }
+
+  // Uma entrada por QUESTÃO, mesmo que ela tenha mais de um problema: é um
+  // link só, e você move a questão uma vez só.
+  function questoesComProblema() {
+    const porSala = new Map();
+
+    const anota = (r, q, problema) => {
+      const sala = nomeCurto(r.curso);
+      if (!porSala.has(sala)) porSala.set(sala, new Map());
+      const daSala = porSala.get(sala);
+      const chave = `${r.banco.cmid}:${q.id}`;
+      if (!daSala.has(chave)) {
+        daSala.set(chave, { id: Number(q.id), categoria: q.categoria || '', link: linkParaMover(r, q), problemas: new Map() });
+      }
+      const item = daSala.get(chave);
+      item.problemas.set(problema, (item.problemas.get(problema) || 0) + 1);
+    };
 
     relatorio.forEach((r) => {
-      const sala = nomeCurto(r.curso);
-      if (r.semBanco) {
-        if (!soProblemas) linhas.push([sala, '', 'Sala sem banco de questões', '', '', '', '']);
-        return;
-      }
-      const banco = r.banco ? r.banco.nome : '';
-
-      r.duplicadas.forEach((grupo, i) => {
-        grupo.forEach((q) => linhas.push([sala, banco, `Questão duplicada (grupo ${i + 1})`,
-          q.categoria || '', nomeDaQuestao(q), `${grupo.length} questões iguais`, q.url || '']));
+      if (!r.banco) return;
+      r.duplicadas.forEach((grupo) => grupo.forEach((q, i) => {
+        anota(r, q, `Questão duplicada (cópia ${i + 1} de ${grupo.length})`);
+      }));
+      r.repetidas.forEach((rep) => {
+        anota(r, rep.questao, `Alternativa repetida (letras ${rep.letras})${rep.soImagem ? ' — mesma imagem' : ''}`);
       });
-      r.repetidas.forEach((rep) => linhas.push([sala, banco, 'Alternativa repetida',
-        rep.questao.categoria || '', nomeDaQuestao(rep.questao),
-        `letras ${rep.letras} (${rep.quantidade}x)${rep.soImagem ? ' — mesma imagem' : ''}: ${rep.texto}`, rep.url || '']));
-      r.imagens.forEach((img) => linhas.push([sala, banco, 'Imagem quebrada',
-        img.questao.categoria || '', nomeDaQuestao(img.questao), img.motivo, img.endereco]));
-      r.vazias.forEach((v) => linhas.push([sala, banco, 'Alternativa em branco',
-        v.questao.categoria || '', nomeDaQuestao(v.questao), `letras ${v.letras}`, v.url || '']));
-      r.falhas.forEach((f) => linhas.push([sala, banco, 'Não consegui ler', '', '', f, '']));
-      if (!soProblemas && !totalDeProblemas(r) && !r.falhas.length) {
-        linhas.push([sala, banco, 'Sem problemas', '', '', `${r.lidas} questão(ões) conferidas`, '']);
-      }
+      r.imagens.forEach((img) => anota(r, img.questao, 'Imagem quebrada'));
+      r.vazias.forEach((v) => anota(r, v.questao, `Alternativa em branco (letras ${v.letras})`));
+      (r.naoLidas || []).forEach((n) => anota(r, n.questao, 'Não consegui conferir esta questão'));
     });
 
-    const campo = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    return porSala;
+  }
+
+  function txtDoRelatorio() {
+    const porSala = questoesComProblema();
+    let quantidade = 0;
+    const blocos = [];
+
+    porSala.forEach((itens, sala) => {
+      // AV1 antes de AV2, e dentro de cada uma na ordem do banco.
+      const lista = [...itens.values()].sort((a, b) =>
+        a.categoria.localeCompare(b.categoria, 'pt-BR', { numeric: true }) || a.id - b.id);
+      quantidade += lista.length;
+
+      const linhas = ['==================================================', sala, ''];
+      lista.forEach((item) => {
+        const problemas = [...item.problemas].map(([p, n]) => (n > 1 ? `${p} (${n}x)` : p)).join(' · ');
+        linhas.push(`[${item.categoria || 'sem categoria'}] ${problemas}`);
+        linhas.push(item.link);
+        linhas.push('');
+      });
+      blocos.push(linhas.join('\r\n'));
+    });
+
+    // Banco que nem deu para abrir não tem questão para listar, mas precisa
+    // aparecer: senão o relatório dá a entender que ele foi conferido.
+    const naoConferidos = relatorio
+      .filter((r) => r.banco && !r.lidas && r.falhas.some((f) => !/^questão \d+/.test(f)))
+      .map((r) => `${nomeCurto(r.curso)} — ${r.falhas.find((f) => !/^questão \d+/.test(f))}`);
+
+    const agora = new Date();
+    const data = agora.toLocaleDateString('pt-BR') + ' ' + agora.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const salas = new Set(relatorio.map((r) => r.curso.id)).size;
+
+    const cabecalho = [
+      'CONFERÊNCIA DAS QUESTÕES DOS BANCOS',
+      `${data} · ${salas} sala(s) conferida(s) · ${quantidade} questão(ões) com problema`,
+      '',
+      'Cada link abre o banco na categoria da questão, com ela destacada em amarelo.',
+      'Marque a caixinha dela e use "Mover para…" para trocá-la de categoria.',
+      '',
+    ];
+
+    const rodape = naoConferidos.length
+      ? ['==================================================', 'BANCOS QUE NÃO CONSEGUI CONFERIR', '',
+        ...naoConferidos, '']
+      : [];
+
     return {
-      // Menos o cabeçalho.
-      quantidade: linhas.length - 1,
-      texto: '﻿' + linhas.map((l) => l.map(campo).join(CONFIG.separadorCsv)).join('\r\n'),
+      quantidade: quantidade + naoConferidos.length,
+      // BOM e CRLF: o Bloco de Notas do Windows abre com os acentos certos.
+      texto: '\ufeff' + [...cabecalho, ...blocos, ...rodape].join('\r\n'),
     };
   }
 
-  function baixarCsv() {
-    const planilha = csvDoRelatorio();
-    // Planilha com só o cabeçalho não ajuda ninguém: digo no log e não baixo.
-    if (!planilha.quantidade) {
-      log('Nenhum problema encontrado — não há nada para pôr na planilha.', 'ok');
+  function baixarTxt() {
+    const relatorioTxt = txtDoRelatorio();
+    // Relatório vazio não ajuda ninguém: digo no log e não baixo.
+    if (!relatorioTxt.quantidade) {
+      log('Nenhum problema encontrado — não há nada para pôr no relatório.', 'ok');
       return;
     }
-    const blob = new Blob([planilha.texto], { type: 'text/csv;charset=utf-8' });
+    const blob = new Blob([relatorioTxt.texto], { type: 'text/plain;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     const agora = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
-    a.download = `conferencia-questoes-${agora}.csv`;
+    a.download = `conferencia-questoes-${agora}.txt`;
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-    log(`Planilha gerada com ${planilha.quantidade} linha(s) de problema.`, 'ok');
+    log(`Relatório gerado com ${relatorioTxt.quantidade} questão(ões) com problema.`, 'ok');
   }
 
   // ----------------------------------------------------------------------
@@ -1024,8 +1082,8 @@
   const botaoDiagnosticar = criaBotao('Diagnosticar (1 sala)', '#6c757d', diagnosticar);
   const botaoCopiar = criaBotao('Copiar resumo', '#2d5bd0', copiarResumo);
   botaoCopiar.style.display = 'none';
-  const botaoCsv = criaBotao('Baixar planilha', '#17724d', baixarCsv);
-  botaoCsv.style.display = 'none';
+  const botaoTxt = criaBotao('Baixar relatório (.txt)', '#17724d', baixarTxt);
+  botaoTxt.style.display = 'none';
   const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
   botaoParar.style.display = 'none';
 
