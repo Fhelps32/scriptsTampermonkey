@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir questões dos bancos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
-// @version      1.3
+// @version      1.4
 // @description  Onde usar: abra a categoria com a lista das salas e use o painel no canto da tela. Com um clique ele entra em todas as salas, abre os bancos de questões e procura questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem é comparada pelo conteúdo da imagem, não pelo texto vazio.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -45,6 +45,9 @@
     // página de erro do Moodle disfarçada).
     exigirTipoDeImagem: true,
     baixarCsvAoFinal: true,
+    // Planilha só com as questões que têm problema. Com false, ela volta a
+    // trazer também uma linha por banco sem problema e por sala sem banco.
+    apenasProblemasNaPlanilha: true,
     separadorCsv: ';',
   };
 
@@ -718,8 +721,10 @@
       resumo.split('\n').forEach((l) => log(l));
       if (relatorio.length) {
         botaoCopiar.style.display = '';
-        botaoCsv.style.display = '';
-        if (CONFIG.baixarCsvAoFinal) baixarCsv();
+        if (csvDoRelatorio().quantidade) {
+          botaoCsv.style.display = '';
+          if (CONFIG.baixarCsvAoFinal) baixarCsv();
+        }
       }
     } catch (e) {
       log(`Parou: ${e.message}`, 'erro');
@@ -816,13 +821,21 @@
   // ----------------------------------------------------------------------
   // Mesmo formato do diagnóstico dos bancos: BOM + ponto e vírgula + CRLF, que
   // é o que o Excel em português abre já em colunas.
+  // Uma linha por problema encontrado. Sala sem banco e banco sem problema
+  // ficam fora: a planilha é a lista de trabalho, e sala que está em ordem não
+  // dá trabalho. Esses dois casos continuam no resumo, que é onde servem de
+  // contexto ("conferi 19 salas, 2 não têm banco").
   function csvDoRelatorio() {
     const cabecalho = ['Sala', 'Banco', 'Problema', 'Categoria', 'Questão', 'Detalhe', 'Endereço'];
     const linhas = [cabecalho];
+    const soProblemas = CONFIG.apenasProblemasNaPlanilha;
 
     relatorio.forEach((r) => {
       const sala = nomeCurto(r.curso);
-      if (r.semBanco) { linhas.push([sala, '', 'Sala sem banco de questões', '', '', '', '']); return; }
+      if (r.semBanco) {
+        if (!soProblemas) linhas.push([sala, '', 'Sala sem banco de questões', '', '', '', '']);
+        return;
+      }
       const banco = r.banco ? r.banco.nome : '';
 
       r.duplicadas.forEach((grupo, i) => {
@@ -837,17 +850,27 @@
       r.vazias.forEach((v) => linhas.push([sala, banco, 'Alternativa em branco',
         v.questao.categoria || '', nomeDaQuestao(v.questao), `letras ${v.letras}`, v.url || '']));
       r.falhas.forEach((f) => linhas.push([sala, banco, 'Não consegui ler', '', '', f, '']));
-      if (!totalDeProblemas(r) && !r.falhas.length) {
+      if (!soProblemas && !totalDeProblemas(r) && !r.falhas.length) {
         linhas.push([sala, banco, 'Sem problemas', '', '', `${r.lidas} questão(ões) conferidas`, '']);
       }
     });
 
     const campo = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-    return '﻿' + linhas.map((l) => l.map(campo).join(CONFIG.separadorCsv)).join('\r\n');
+    return {
+      // Menos o cabeçalho.
+      quantidade: linhas.length - 1,
+      texto: '﻿' + linhas.map((l) => l.map(campo).join(CONFIG.separadorCsv)).join('\r\n'),
+    };
   }
 
   function baixarCsv() {
-    const blob = new Blob([csvDoRelatorio()], { type: 'text/csv;charset=utf-8' });
+    const planilha = csvDoRelatorio();
+    // Planilha com só o cabeçalho não ajuda ninguém: digo no log e não baixo.
+    if (!planilha.quantidade) {
+      log('Nenhum problema encontrado — não há nada para pôr na planilha.', 'ok');
+      return;
+    }
+    const blob = new Blob([planilha.texto], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     const agora = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
@@ -855,7 +878,7 @@
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-    log('Planilha gerada.', 'ok');
+    log(`Planilha gerada com ${planilha.quantidade} linha(s) de problema.`, 'ok');
   }
 
   // ----------------------------------------------------------------------
