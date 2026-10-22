@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir questões dos bancos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
-// @version      1.0
+// @version      1.1
 // @description  Onde usar: abra a categoria com a lista das salas e use o painel no canto da tela. Com um clique ele entra em todas as salas, abre os bancos de questões e procura questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem é comparada pelo conteúdo da imagem, não pelo texto vazio.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -159,39 +159,84 @@
   // ----------------------------------------------------------------------
   // Categorias e questões de um banco
   // ----------------------------------------------------------------------
-  // O seletor de categorias da página do banco traz "catid,contextid" em cada
-  // opção. Eu varro categoria por categoria com includesubcategories=0, então
-  // cada questão aparece uma única vez — se eu pedisse com subcategorias, a
-  // questão de uma subcategoria viria duas vezes e seria acusada de duplicada
-  // sem ser.
+  // De onde vêm as categorias. Na versão nova do Moodle a página do banco NÃO
+  // tem mais um <select> de categorias: o filtro é um componente montado por
+  // JavaScript. O select de verdade, com "catid,contextid" em cada opção, está
+  // nos formulários de exportar e de importar — é de lá que os outros scripts
+  // leem, e é de lá que eu leio também. Ponho o de exportar na frente porque
+  // esta varredura é só leitura.
+  const PAGINAS_DE_CATEGORIA = [
+    { rotulo: 'exportar', url: (cmid) => `${ORIGEM}/question/bank/exportquestions/export.php?cmid=${cmid}` },
+    { rotulo: 'importar', url: (cmid) => `${ORIGEM}/question/bank/importquestions/import.php?cmid=${cmid}` },
+    { rotulo: 'página do banco', url: (cmid) => `${ORIGEM}/question/edit.php?cmid=${cmid}` },
+  ];
+
   function categoriasDoDocumento(doc) {
     if (!doc) return [];
     const cats = new Map();
-    doc.querySelectorAll('select[name="cat"] option, select[name="category"] option').forEach((op) => {
-      const valor = (op.getAttribute('value') || '').trim();
-      const m = valor.match(/^(\d+),(\d+)$/);
-      if (!m) return;
-      if (!cats.has(valor)) cats.set(valor, { valor, id: m[1], contextid: m[2], nome: txt(op).replace(/\s*\(\d+\)\s*$/, '') });
+    const guarda = (valor, nome, contexto) => {
+      const m = String(valor || '').trim().match(/^(\d+),(\d+)$/);
+      if (!m || cats.has(m[0])) return;
+      const limpo = String(nome || '').replace(/\s*\(\d+\)\s*$/, '').replace(/^[\s\u00a0]+/, '').trim();
+      cats.set(m[0], { valor: m[0], id: m[1], contextid: m[2], nome: limpo || `categoria ${m[1]}`, contexto: contexto || '' });
+    };
+
+    // O select é um "selectgroups": as opções vêm agrupadas por contexto.
+    doc.querySelectorAll('select[name="category"], select[name="cat"]').forEach((sel) => {
+      sel.querySelectorAll('option').forEach((op) => {
+        const grupo = op.closest('optgroup');
+        guarda(op.getAttribute('value'), txt(op), grupo ? (grupo.getAttribute('label') || '') : '');
+      });
     });
-    // Alguns temas trocam o <select> por um menu: aproveito os links também.
-    doc.querySelectorAll('a[href*="cat="]').forEach((a) => {
-      const cat = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('cat');
-      const m = (cat || '').match(/^(\d+),(\d+)$/);
-      if (!m || cats.has(cat)) return;
-      cats.set(cat, { valor: cat, id: m[1], contextid: m[2], nome: txt(a) });
-    });
+
+    // Último recurso: algum tema que ainda desenhe as categorias como links.
+    if (!cats.size) {
+      doc.querySelectorAll('a[href*="cat="]').forEach((a) => {
+        const cat = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('cat');
+        guarda(cat, txt(a), '');
+      });
+    }
     return [...cats.values()];
   }
 
-  async function categoriasDoBanco(cmid) {
-    const url = `${ORIGEM}/question/edit.php?cmid=${encodeURIComponent(cmid)}`;
-    let r = await baixaPagina(url);
-    let cats = categoriasDoDocumento(r.doc);
-    if (!cats.length && CONFIG.usarIframe) {
-      const doc = await carregaComJs(url, (d) => categoriasDoDocumento(d).length > 0);
-      cats = categoriasDoDocumento(doc);
+  // O contexto do banco. Preciso dele porque o select de categorias pode
+  // trazer também as categorias dos contextos de cima (o curso, o sistema) —
+  // e questão de outro banco entrando aqui viraria "duplicada" sem ser.
+  function contextoDaPagina(html) {
+    const m = String(html || '').match(/"contextid"\s*:\s*(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  async function categoriasDoBanco(cmid, anota) {
+    for (const pagina of PAGINAS_DE_CATEGORIA) {
+      const url = pagina.url(encodeURIComponent(cmid));
+      let r = await baixaPagina(url);
+      let cats = categoriasDoDocumento(r.doc);
+      let html = r.html;
+
+      if (!cats.length && CONFIG.usarIframe) {
+        const doc = await carregaComJs(url, (d) => categoriasDoDocumento(d).length > 0);
+        cats = categoriasDoDocumento(doc);
+        if (doc) html = doc.documentElement ? doc.documentElement.outerHTML : html;
+      }
+      if (!cats.length) {
+        if (anota) anota(`      sem categorias na tela de ${pagina.rotulo} (HTTP ${r.status})`);
+        continue;
+      }
+
+      const contexto = contextoDaPagina(html);
+      const doBanco = contexto ? cats.filter((c) => c.contextid === contexto) : cats;
+      const usar = doBanco.length ? doBanco : cats;
+      const sobraram = cats.length - usar.length;
+
+      if (anota) {
+        anota(`      categorias lidas na tela de ${pagina.rotulo}`
+          + (contexto ? ` (contexto ${contexto})` : ' (não achei o contexto do banco)')
+          + (sobraram > 0 ? ` — ${sobraram} de outro contexto ficaram de fora` : ''));
+      }
+      return usar;
     }
-    return cats;
+    return [];
   }
 
   function urlDaListagem(cmid, cat, pagina) {
@@ -489,7 +534,7 @@
       duplicadas: [], repetidas: [], vazias: [], imagens: [], falhas: [],
     };
 
-    const cats = await categoriasDoBanco(banco.cmid);
+    const cats = await categoriasDoBanco(banco.cmid, anota);
     if (!cats.length) {
       resultado.falhas.push('não achei as categorias deste banco');
       return resultado;
