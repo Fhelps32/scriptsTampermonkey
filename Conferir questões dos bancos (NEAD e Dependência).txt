@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir questões dos bancos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
-// @version      1.1
+// @version      1.2
 // @description  Onde usar: abra a categoria com a lista das salas e use o painel no canto da tela. Com um clique ele entra em todas as salas, abre os bancos de questões e procura questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem é comparada pelo conteúdo da imagem, não pelo texto vazio.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -239,18 +239,33 @@
     return [];
   }
 
-  function urlDaListagem(cmid, cat, pagina) {
+  // O parâmetro "filter" é lido pelo Moodle com PARAM_RAW e passado por
+  // json_decode (question/editlib.php). Ou seja, ele é uma STRING JSON — e não
+  // campos aninhados filter[category][...], que era o que eu mandava antes.
+  // Mandando array, o optional_param do Moodle reclama e o filtro chega sem
+  // valores: a listagem vinha vazia e o banco parecia não ter questão nenhuma.
+  function filtroDeCategoria(cat) {
+    return JSON.stringify({
+      category: {
+        name: 'category',
+        jointype: 1,
+        values: [Number(cat.id)],
+        filteroptions: { includesubcategories: false },
+      },
+    });
+  }
+
+  function urlDaListagem(cmid, cat, pagina, comFiltro) {
     const p = new URLSearchParams();
     p.set('cmid', String(cmid));
     p.set('cat', cat.valor);
     p.set('qpage', String(pagina));
     p.set('qperpage', String(CONFIG.questoesPorPagina));
-    // O filtro é obrigatório aqui: sem ele o Moodle usa a última preferência
-    // do usuário para "incluir subcategorias", e o resultado mudaria de um
-    // navegador para outro.
-    p.set('filter[category][jointype]', '1');
-    p.set('filter[category][values][0]', cat.id);
-    p.set('filter[category][filteroptions][includesubcategories]', '0');
+    // Com o filtro eu fico independente da última preferência do usuário para
+    // "incluir subcategorias". Sem ele, o Moodle decide sozinho — e aí a
+    // varredura ainda funciona, porque as questões são juntadas por id e
+    // repetição entre categorias se desfaz sozinha.
+    if (comFiltro) p.set('filter', filtroDeCategoria(cat));
     return `${ORIGEM}/question/edit.php?${p.toString()}`;
   }
 
@@ -290,24 +305,41 @@
     return [...achadas.values()];
   }
 
+  // Três tentativas, em ordem: com filtro, sem filtro e por iframe. O formato
+  // do filtro mudou entre versões do Moodle, então não dependo de uma só.
   async function questoesDaCategoria(cmid, cat, anota) {
-    const questoes = new Map();
-    for (let pagina = 0; pagina < 100; pagina++) {
-      const url = urlDaListagem(cmid, cat, pagina);
-      let r = await baixaPagina(url);
-      let achadas = questoesDoDocumento(r.doc);
-      if (!achadas.length && pagina === 0 && CONFIG.usarIframe) {
-        const doc = await carregaComJs(url, (d) => questoesDoDocumento(d).length > 0);
-        achadas = questoesDoDocumento(doc);
+    const tentativas = [
+      { rotulo: 'com filtro', comFiltro: true, js: false },
+      { rotulo: 'sem filtro', comFiltro: false, js: false },
+      { rotulo: 'com JavaScript', comFiltro: false, js: true },
+    ];
+
+    for (const t of tentativas) {
+      const questoes = new Map();
+      for (let pagina = 0; pagina < 100; pagina++) {
+        const url = urlDaListagem(cmid, cat, pagina, t.comFiltro);
+        let achadas;
+        if (t.js) {
+          const doc = await carregaComJs(url, (d) => questoesDoDocumento(d).length > 0);
+          achadas = questoesDoDocumento(doc);
+        } else {
+          const r = await baixaPagina(url);
+          achadas = questoesDoDocumento(r.doc);
+        }
+        const novas = achadas.filter((q) => !questoes.has(q.id));
+        novas.forEach((q) => questoes.set(q.id, q));
+        if (!novas.length) break;
       }
-      const novas = achadas.filter((q) => !questoes.has(q.id));
-      novas.forEach((q) => questoes.set(q.id, q));
-      if (anota && pagina === 0 && !achadas.length) anota(`      categoria "${cat.nome}": nenhuma questão`);
-      // Página sem nada novo significa que a listagem acabou (ou que a
-      // paginação não está sendo respeitada — nos dois casos, paro aqui).
-      if (!novas.length) break;
+      if (questoes.size) {
+        if (anota && t.rotulo !== 'com filtro') {
+          anota(`      categoria "${cat.nome}": li a listagem ${t.rotulo}`);
+        }
+        return [...questoes.values()];
+      }
     }
-    return [...questoes.values()];
+
+    if (anota) anota(`      categoria "${cat.nome}": nenhuma questão na listagem`);
+    return [];
   }
 
   // ----------------------------------------------------------------------
@@ -785,6 +817,94 @@
   }
 
   // ----------------------------------------------------------------------
+  // Diagnóstico
+  // ----------------------------------------------------------------------
+  // Olha UMA sala e conta tudo que encontrou em cada etapa. Serve para quando
+  // a varredura não acha questão: em vez de adivinhar, o log mostra o que a
+  // página devolveu de fato.
+  async function diagnosticar() {
+    if (rodando) return;
+    rodando = true; interromper = false;
+    travaBotoes(true); botaoParar.style.display = '';
+    painelLog.innerHTML = '';
+
+    try {
+      const cursos = await listarCursos();
+      log(`${cursos.length} sala(s) nesta categoria. Vou diagnosticar a primeira que tiver banco.`);
+
+      for (const curso of cursos) {
+        if (interromper) break;
+        log(`Sala: ${nomeCurto(curso)} (id ${curso.id})`);
+
+        const bancos = await bancosDoCurso(curso.id);
+        log(`   bancos achados: ${bancos.length}${bancos.length ? ` — ${bancos.map((b) => `"${b.nome}" (cmid ${b.cmid})`).join(', ')}` : ''}`);
+        if (!bancos.length) continue;
+
+        const banco = bancos[0];
+
+        for (const pagina of PAGINAS_DE_CATEGORIA) {
+          const url = pagina.url(encodeURIComponent(banco.cmid));
+          const r = await baixaPagina(url);
+          const selects = r.doc ? r.doc.querySelectorAll('select[name="category"], select[name="cat"]').length : 0;
+          const cats = categoriasDoDocumento(r.doc);
+          log(`   tela de ${pagina.rotulo}: HTTP ${r.status}, ${selects} select(s), ${cats.length} categoria(s)`
+            + `, contexto ${contextoDaPagina(r.html) || '—'}`);
+          cats.slice(0, 12).forEach((c) => log(`      · "${c.nome}" cat=${c.valor} contexto=${c.contextid} grupo="${c.contexto}"`));
+        }
+
+        const cats = await categoriasDoBanco(banco.cmid, (m) => log(m));
+        if (!cats.length) { log('   PAREI AQUI: nenhuma categoria.', 'erro'); break; }
+
+        for (const cat of cats.slice(0, 3)) {
+          for (const comFiltro of [true, false]) {
+            const url = urlDaListagem(banco.cmid, cat, 0, comFiltro);
+            const r = await baixaPagina(url);
+            const d = r.doc;
+            const caixas = d ? d.querySelectorAll('input[type="checkbox"][name^="q"]').length : 0;
+            const previews = d ? d.querySelectorAll('a[href*="preview.php"]').length : 0;
+            const linhas = d ? d.querySelectorAll('#questionscontainer tbody tr, .categoryquestionscontainer tbody tr, tbody tr').length : 0;
+            const achadas = questoesDoDocumento(d);
+            log(`   listagem "${cat.nome}" ${comFiltro ? 'COM' : 'SEM'} filtro: HTTP ${r.status}`
+              + `, container ${d && d.querySelector('#questionscontainer') ? 'sim' : 'não'}`
+              + `, ${linhas} linha(s), ${caixas} caixa(s) "q<id>", ${previews} link(s) de pré-visualização`
+              + `, ${achadas.length} questão(ões) reconhecida(s)`, achadas.length ? 'ok' : 'aviso');
+
+            // O Moodle embute no HTML o filtro que ele realmente entendeu.
+            // É a resposta mais direta para saber se o filtro chegou certo.
+            const marca = d && d.querySelector('[data-filtercondition]');
+            if (marca) log(`      filtro entendido pelo Moodle: ${(marca.getAttribute('data-filtercondition') || '').slice(0, 400)}`);
+            const aviso = d && (d.querySelector('.alert-danger, .errorbox, .notifyproblem'));
+            if (aviso) log(`      AVISO NA PÁGINA: ${txt(aviso).slice(0, 300)}`, 'erro');
+            if (!achadas.length && d) {
+              const corpo = d.querySelector('#questionscontainer') || d.querySelector('#region-main') || d.body;
+              log(`      texto da área das questões: "${txt(corpo).slice(0, 300)}"`);
+            }
+            if (achadas.length) {
+              achadas.slice(0, 3).forEach((q) => log(`      · questão ${q.id} "${q.nome}"`));
+              const alvo = achadas[0];
+              const pv = await baixaPagina(urlDaPreVisualizacao(banco.cmid, alvo.id));
+              const f = pv.doc && pv.doc.querySelector('.formulation');
+              log(`      pré-visualização da questão ${alvo.id}: HTTP ${pv.status}`
+                + `, .formulation ${f ? 'sim' : 'NÃO'}`
+                + `, .qtext ${pv.doc && pv.doc.querySelector('.qtext') ? 'sim' : 'não'}`
+                + `, ${pv.doc ? pv.doc.querySelectorAll('.answer .flex-fill').length : 0} alternativa(s)`,
+                f ? 'ok' : 'erro');
+            }
+          }
+        }
+        break;
+      }
+      log('');
+      log('Fim do diagnóstico. Copie este log e me mande.', 'ok');
+    } catch (e) {
+      log(`Parou: ${e.message}`, 'erro');
+    } finally {
+      rodando = false; interromper = false;
+      travaBotoes(false); botaoParar.style.display = 'none'; botaoParar.textContent = 'Parar';
+    }
+  }
+
+  // ----------------------------------------------------------------------
   // Painel
   // ----------------------------------------------------------------------
   // O painel se limita ao que cabe na tela: com a página ampliada, largura
@@ -822,7 +942,7 @@
   explicacao.textContent = 'Entra em cada sala desta categoria, abre os bancos de questões e procura: '
     + 'questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem '
     + 'é comparada pelo conteúdo da imagem, então duas imagens diferentes não são acusadas de iguais. '
-    + 'Nada é alterado — é só leitura.';
+    + 'Nada é alterado — é só leitura. Se não achar questão, use "Diagnosticar (1 sala)" e me mande o log.';
 
   const botoes = document.createElement('div');
   botoes.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
@@ -836,6 +956,7 @@
   };
 
   const botao = criaBotao('Conferir as questões', '#28a745', verificar);
+  const botaoDiagnosticar = criaBotao('Diagnosticar (1 sala)', '#6c757d', diagnosticar);
   const botaoCopiar = criaBotao('Copiar resumo', '#2d5bd0', copiarResumo);
   botaoCopiar.style.display = 'none';
   const botaoCsv = criaBotao('Baixar planilha', '#17724d', baixarCsv);
@@ -843,7 +964,7 @@
   const botaoParar = criaBotao('Parar', '#b3261e', () => { interromper = true; botaoParar.textContent = 'Parando…'; });
   botaoParar.style.display = 'none';
 
-  const travaBotoes = (t) => { botao.disabled = t; };
+  const travaBotoes = (t) => { botao.disabled = t; botaoDiagnosticar.disabled = t; };
 
   const painelLog = document.createElement('div');
   painelLog.style.cssText = `margin-top:8px;max-height:45vh;overflow:auto;white-space:pre-wrap;
