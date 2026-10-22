@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Conferir questões dos bancos (NEAD e Dependência)
 // @namespace    https://nead.ugb.edu.br/
-// @version      1.2
+// @version      1.3
 // @description  Onde usar: abra a categoria com a lista das salas e use o painel no canto da tela. Com um clique ele entra em todas as salas, abre os bancos de questões e procura questão duplicada, alternativa repetida e imagem quebrada. Questão ou alternativa que é só imagem é comparada pelo conteúdo da imagem, não pelo texto vazio.
 // @author       Você
 // @match        https://nead.ugb.edu.br/course/index.php*
@@ -25,6 +25,11 @@
     pausaEntreSalasMs: 500,
     pausaEntreQuestoesMs: 120,
     pausaEntreImagensMs: 60,
+    // Categorias do banco que não devem ser conferidas. A comparação é sem
+    // acento e sem diferença de maiúscula, e vale se o nome CONTIVER o termo.
+    // Ex.: [/DEFEITU/, /COM DEFEITO/] para pular as categorias onde vocês
+    // guardam de propósito as questões com problema.
+    ignorarCategorias: [],
     // Uma sala pode ter mais de um banco. Deixe vazio para conferir todos;
     // para conferir só um, ponha algo como /ADP[\s\-_.]*DEP/i.
     filtroDeBanco: null,
@@ -121,6 +126,14 @@
 
   const nomeCurto = (curso) => curso.nome.replace(/\[[^\]]*\]\s*/g, '').replace(/\s*[•⬩].*$/, '').trim();
 
+  // Nos bancos de vocês o nome da questão costuma ser o enunciado inteiro.
+  // Encurto para o relatório não virar uma parede de texto; o link vai junto.
+  const nomeDaQuestao = (q) => {
+    const n = (q.nome || '').trim();
+    if (!n) return `questão ${q.id}`;
+    return (n.length > 90 ? `${n.slice(0, 90)}…` : n) + ` (id ${q.id})`;
+  };
+
   // ----------------------------------------------------------------------
   // Bancos de questões da sala
   // ----------------------------------------------------------------------
@@ -170,6 +183,10 @@
     { rotulo: 'importar', url: (cmid) => `${ORIGEM}/question/bank/importquestions/import.php?cmid=${cmid}` },
     { rotulo: 'página do banco', url: (cmid) => `${ORIGEM}/question/edit.php?cmid=${cmid}` },
   ];
+
+  // "Topo para X" (em inglês, "Top for X") é o nome que o Moodle dá à
+  // categoria raiz do banco.
+  const RE_CATEGORIA_TOPO = /^(TOPO PARA|TOP FOR)\b/;
 
   function categoriasDoDocumento(doc) {
     if (!doc) return [];
@@ -226,13 +243,29 @@
 
       const contexto = contextoDaPagina(html);
       const doBanco = contexto ? cats.filter((c) => c.contextid === contexto) : cats;
-      const usar = doBanco.length ? doBanco : cats;
-      const sobraram = cats.length - usar.length;
+      let usar = doBanco.length ? doBanco : cats;
+      const deOutroContexto = cats.length - usar.length;
+
+      // A categoria "topo" é só o guarda-chuva do banco: ela nunca tem questão
+      // e aparece na tela de exportar ("Topo para …"). Tiro para não gastar
+      // requisição com ela. Se por acaso ela for a única, mantenho.
+      const semTopo = usar.filter((c) => !RE_CATEGORIA_TOPO.test(norm(c.nome)));
+      if (semTopo.length) usar = semTopo;
+
+      const ignoradas = [];
+      if (CONFIG.ignorarCategorias.length) {
+        usar = usar.filter((c) => {
+          const pular = CONFIG.ignorarCategorias.some((re) => re.test(norm(c.nome)));
+          if (pular) ignoradas.push(c.nome);
+          return !pular;
+        });
+      }
 
       if (anota) {
         anota(`      categorias lidas na tela de ${pagina.rotulo}`
           + (contexto ? ` (contexto ${contexto})` : ' (não achei o contexto do banco)')
-          + (sobraram > 0 ? ` — ${sobraram} de outro contexto ficaram de fora` : ''));
+          + (deOutroContexto > 0 ? ` — ${deOutroContexto} de outro contexto ficaram de fora` : ''));
+        if (ignoradas.length) anota(`      ignorando por configuração: ${ignoradas.join(' | ')}`);
       }
       return usar;
     }
@@ -283,43 +316,48 @@
       else if (!atual.nome && nome) atual.nome = nome;
     };
 
-    const nomeDaLinha = (linha) => {
+    // O nome está no link que leva à edição daquela questão. Procuro por ele
+    // antes de recorrer a palpites: pegar "o link mais comprido da linha"
+    // trazia junto a coluna do texto da questão.
+    const nomeDaLinha = (linha, id) => {
       if (!linha) return '';
+      const doId = [...linha.querySelectorAll('a[href]')].find((a) => {
+        const href = a.getAttribute('href') || '';
+        if (/preview\.php/.test(href)) return false;
+        const p = new URL(href, ORIGEM).searchParams;
+        return p.get('id') === String(id) && /question\.php|editquestion/.test(href);
+      });
+      if (doId && txt(doId)) return txt(doId);
       const celula = linha.querySelector('.questionname, td.questionname');
       if (celula && txt(celula)) return txt(celula);
-      const links = [...linha.querySelectorAll('a')]
-        .map((a) => txt(a)).filter((t) => t.length > 1);
+      const links = [...linha.querySelectorAll('a')].map((a) => txt(a)).filter((t) => t.length > 1);
       return links.sort((a, b) => b.length - a.length)[0] || '';
     };
 
     doc.querySelectorAll('input[type="checkbox"][name]').forEach((c) => {
       const m = (c.getAttribute('name') || '').match(/^q(\d+)$/);
-      if (m) guarda(m[1], nomeDaLinha(c.closest('tr')));
+      if (m) guarda(m[1], nomeDaLinha(c.closest('tr'), m[1]));
     });
 
     doc.querySelectorAll('a[href*="previewquestion/preview.php"], a[href*="/question/preview.php"]').forEach((a) => {
       const id = new URL(a.getAttribute('href'), ORIGEM).searchParams.get('id');
-      guarda(id, nomeDaLinha(a.closest('tr')));
+      guarda(id, nomeDaLinha(a.closest('tr'), id));
     });
 
     return [...achadas.values()];
   }
 
-  // Três tentativas, em ordem: com filtro, sem filtro e por iframe. O formato
-  // do filtro mudou entre versões do Moodle, então não dependo de uma só.
-  async function questoesDaCategoria(cmid, cat, anota) {
-    const tentativas = [
-      { rotulo: 'com filtro', comFiltro: true, js: false },
-      { rotulo: 'sem filtro', comFiltro: false, js: false },
-      { rotulo: 'com JavaScript', comFiltro: false, js: true },
-    ];
-
-    for (const t of tentativas) {
+  // Duas formas de pedir a listagem: com e sem o filtro. O formato do filtro
+  // mudou entre versões do Moodle, então não dependo de uma só. O iframe NÃO
+  // entra aqui: ele custa segundos e só faz sentido quando o banco INTEIRO
+  // vem vazio, o que é tratado em confereBanco — categoria vazia é normal.
+  async function questoesDaCategoria(cmid, cat, comJs) {
+    for (const comFiltro of [true, false]) {
       const questoes = new Map();
       for (let pagina = 0; pagina < 100; pagina++) {
-        const url = urlDaListagem(cmid, cat, pagina, t.comFiltro);
+        const url = urlDaListagem(cmid, cat, pagina, comFiltro);
         let achadas;
-        if (t.js) {
+        if (comJs) {
           const doc = await carregaComJs(url, (d) => questoesDoDocumento(d).length > 0);
           achadas = questoesDoDocumento(doc);
         } else {
@@ -330,16 +368,10 @@
         novas.forEach((q) => questoes.set(q.id, q));
         if (!novas.length) break;
       }
-      if (questoes.size) {
-        if (anota && t.rotulo !== 'com filtro') {
-          anota(`      categoria "${cat.nome}": li a listagem ${t.rotulo}`);
-        }
-        return [...questoes.values()];
-      }
+      if (questoes.size) return { questoes: [...questoes.values()], comFiltro };
+      if (comJs) break; // com JavaScript, uma passada basta
     }
-
-    if (anota) anota(`      categoria "${cat.nome}": nenhuma questão na listagem`);
-    return [];
+    return { questoes: [], comFiltro: null };
   }
 
   // ----------------------------------------------------------------------
@@ -574,11 +606,21 @@
     anota(`      ${cats.length} categoria(s): ${cats.map((c) => c.nome).join(' | ')}`);
 
     const questoes = new Map();
-    for (const cat of cats) {
-      if (interromper) break;
-      for (const q of await questoesDaCategoria(banco.cmid, cat, anota)) {
-        if (!questoes.has(q.id)) questoes.set(q.id, { ...q, categoria: cat.nome });
+    const juntar = async (comJs) => {
+      for (const cat of cats) {
+        if (interromper) break;
+        const r = await questoesDaCategoria(banco.cmid, cat, comJs);
+        if (r.comFiltro === false) anota(`      categoria "${cat.nome}": li a listagem sem o filtro`);
+        r.questoes.forEach((q) => {
+          if (!questoes.has(q.id)) questoes.set(q.id, { ...q, categoria: cat.nome });
+        });
       }
+    };
+
+    await juntar(false);
+    if (!questoes.size && CONFIG.usarIframe && !interromper) {
+      anota('      nenhuma questão pelo caminho normal — tentando com JavaScript');
+      await juntar(true);
     }
     resultado.questoes = questoes.size;
     anota(`      ${questoes.size} questão(ões) no banco`);
@@ -608,7 +650,7 @@
           resultado.imagens.push({ questao: q, ...img, url: leitura.url });
         });
       } catch (e) {
-        resultado.falhas.push(`questão ${q.id}${q.nome ? ` ("${q.nome}")` : ''}: ${e.message}`);
+        resultado.falhas.push(`questão ${q.id}${q.nome ? ` ("${q.nome.slice(0, 60)}")` : ''}: ${e.message}`);
       }
       await dorme(CONFIG.pausaEntreQuestoesMs);
     }
@@ -729,23 +771,23 @@
 
       r.duplicadas.forEach((grupo, i) => {
         linhas.push(`   QUESTÕES DUPLICADAS, grupo ${i + 1} (${grupo.length}):`);
-        grupo.forEach((q) => linhas.push(`     - [${q.categoria}] ${q.nome || `questão ${q.id}`} — ${q.url}`));
+        grupo.forEach((q) => linhas.push(`     - [${q.categoria}] ${nomeDaQuestao(q)} — ${q.url}`));
       });
 
       r.repetidas.forEach((rep) => {
         const so = rep.soImagem ? ' (as duas são a MESMA imagem)' : '';
-        linhas.push(`   ALTERNATIVA REPETIDA em "${rep.questao.nome || `questão ${rep.questao.id}`}" — letras ${rep.letras} (${rep.quantidade}x)${so}`);
+        linhas.push(`   ALTERNATIVA REPETIDA em "${nomeDaQuestao(rep.questao)}" — letras ${rep.letras} (${rep.quantidade}x)${so}`);
         linhas.push(`     "${rep.texto}"`);
         linhas.push(`     ${rep.url}`);
       });
 
       r.imagens.forEach((img) => {
-        linhas.push(`   IMAGEM QUEBRADA em "${img.questao.nome || `questão ${img.questao.id}`}": ${img.motivo}`);
+        linhas.push(`   IMAGEM QUEBRADA em "${nomeDaQuestao(img.questao)}": ${img.motivo}`);
         linhas.push(`     ${img.endereco}`);
       });
 
       r.vazias.forEach((v) => {
-        linhas.push(`   ALTERNATIVA EM BRANCO em "${v.questao.nome || `questão ${v.questao.id}`}" — letras ${v.letras}`);
+        linhas.push(`   ALTERNATIVA EM BRANCO em "${nomeDaQuestao(v.questao)}" — letras ${v.letras}`);
       });
 
       if (r.falhas.length) {
@@ -785,15 +827,15 @@
 
       r.duplicadas.forEach((grupo, i) => {
         grupo.forEach((q) => linhas.push([sala, banco, `Questão duplicada (grupo ${i + 1})`,
-          q.categoria || '', q.nome || `questão ${q.id}`, `${grupo.length} questões iguais`, q.url || '']));
+          q.categoria || '', nomeDaQuestao(q), `${grupo.length} questões iguais`, q.url || '']));
       });
       r.repetidas.forEach((rep) => linhas.push([sala, banco, 'Alternativa repetida',
-        rep.questao.categoria || '', rep.questao.nome || `questão ${rep.questao.id}`,
+        rep.questao.categoria || '', nomeDaQuestao(rep.questao),
         `letras ${rep.letras} (${rep.quantidade}x)${rep.soImagem ? ' — mesma imagem' : ''}: ${rep.texto}`, rep.url || '']));
       r.imagens.forEach((img) => linhas.push([sala, banco, 'Imagem quebrada',
-        img.questao.categoria || '', img.questao.nome || `questão ${img.questao.id}`, img.motivo, img.endereco]));
+        img.questao.categoria || '', nomeDaQuestao(img.questao), img.motivo, img.endereco]));
       r.vazias.forEach((v) => linhas.push([sala, banco, 'Alternativa em branco',
-        v.questao.categoria || '', v.questao.nome || `questão ${v.questao.id}`, `letras ${v.letras}`, v.url || '']));
+        v.questao.categoria || '', nomeDaQuestao(v.questao), `letras ${v.letras}`, v.url || '']));
       r.falhas.forEach((f) => linhas.push([sala, banco, 'Não consegui ler', '', '', f, '']));
       if (!totalDeProblemas(r) && !r.falhas.length) {
         linhas.push([sala, banco, 'Sem problemas', '', '', `${r.lidas} questão(ões) conferidas`, '']);
